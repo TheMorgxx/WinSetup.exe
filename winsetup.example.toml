@@ -1,0 +1,369 @@
+# WinSetup — перенос окружения Windows 10
+# Не помещайте сюда пароли, токены и ключи.
+appx_removal = [
+    "Microsoft.549981C3F5F10",
+    "Microsoft.SkypeApp",
+    "Microsoft.Wallet",
+    "Microsoft.MixedReality.Portal",
+    "Microsoft.Microsoft3DViewer",
+    "Microsoft.MSPaint",
+    "Microsoft.People",
+    "Microsoft.GetHelp",
+    "Microsoft.Getstarted",
+    "Microsoft.WindowsFeedbackHub",
+    "Microsoft.WindowsMaps",
+    "Microsoft.MicrosoftSolitaireCollection",
+    "Clipchamp.Clipchamp",
+    "Microsoft.BingWeather",
+    "Microsoft.BingSearch",
+    "Microsoft.MicrosoftOfficeHub",
+    "Microsoft.Office.OneNote",
+    "Microsoft.YourPhone",
+    "MicrosoftWindows.CrossDevice",
+    "Microsoft.ZuneVideo",
+    "Microsoft.Windows.DevHome",
+    "Microsoft.XboxApp",
+    "Microsoft.OutlookForWindows",
+    "microsoft.windowscommunicationsapps",
+    "Microsoft.MicrosoftStickyNotes",
+    "Microsoft.XboxGamingOverlay",
+    "Microsoft.Windows.Photos",
+    "Microsoft.WindowsSoundRecorder",
+    "Microsoft.WindowsCamera",
+    "Microsoft.WindowsAlarms",
+    "Microsoft.ZuneMusic",
+]
+autostart = []
+repositories = []
+
+# Версия формата
+[meta]
+schema_version = 1
+
+# Интерфейс и выбранный диск данных; секреты запрещены
+[application]
+# Раздел безопасных диагностических тестов (по умолчанию выключен)
+dev_mode = false
+mode = "choose"
+theme = "dark"
+selected_profile = "Мой ПК"
+data_drive = ""
+ui_accent = "blue"
+ui_scale = 100
+ui_density = "normal"
+ui_animations = true
+ui_anim_speed = "normal"
+ui_reduce_motion = false
+ui_start_mode = "choose"
+ui_confirm_close = true
+ui_notify_done = true
+
+# Независимые профили: списки выбранных действий
+[[profiles]]
+name = "Мой ПК"
+programs = [
+    "steam",
+    "discord",
+    "vencord",
+    "firefox",
+    "nvidia",
+    "claude",
+    "telegram",
+    "git",
+    "armoury",
+]
+paths = [
+    "steam",
+    "main",
+    "secondary",
+]
+appx_removal = [
+    "Microsoft.549981C3F5F10",
+    "Microsoft.SkypeApp",
+    "Microsoft.Wallet",
+    "Microsoft.MixedReality.Portal",
+    "Microsoft.Microsoft3DViewer",
+    "Microsoft.MSPaint",
+    "Microsoft.People",
+    "Microsoft.GetHelp",
+    "Microsoft.Getstarted",
+    "Microsoft.WindowsFeedbackHub",
+    "Microsoft.WindowsMaps",
+    "Microsoft.MicrosoftSolitaireCollection",
+    "Clipchamp.Clipchamp",
+    "Microsoft.BingWeather",
+    "Microsoft.BingSearch",
+    "Microsoft.MicrosoftOfficeHub",
+    "Microsoft.Office.OneNote",
+    "Microsoft.YourPhone",
+    "MicrosoftWindows.CrossDevice",
+    "Microsoft.ZuneVideo",
+    "Microsoft.Windows.DevHome",
+    "Microsoft.XboxApp",
+]
+autostart = []
+repositories = []
+restore_backup = false
+
+[profiles.windows_tweaks]
+max_refresh = "enabled"
+notify_discord = "disabled"
+notify_snip = "disabled"
+notify_telegram = "disabled"
+suggestions = "disabled"
+
+[[profiles]]
+name = "Безопасный минимум"
+programs = [
+    "firefox",
+    "git",
+    "telegram",
+]
+paths = []
+appx_removal = []
+autostart = []
+repositories = []
+restore_backup = false
+
+[profiles.windows_tweaks]
+
+[[profiles]]
+name = "Пустой"
+programs = []
+paths = []
+appx_removal = []
+autostart = []
+repositories = []
+restore_backup = false
+
+[profiles.windows_tweaks]
+
+# Только поддерживаемые источники; произвольные команды запрещены
+[[programs]]
+key = "steam"
+name = "Steam"
+source = "winget"
+id = "Valve.Steam"
+version = ""
+location = '{data}\Steam'
+url = "https://winget.run/pkg/Valve/Steam"
+sha256 = ""
+detect_name = ""
+order = 0
+
+[[programs]]
+key = "discord"
+name = "Discord"
+source = "winget"
+id = "Discord.Discord"
+version = ""
+location = ""
+url = "https://winget.run/pkg/Discord/Discord"
+sha256 = ""
+detect_name = ""
+order = 1
+
+[[programs]]
+key = "vencord"
+name = "Vencord"
+source = "winget"
+id = "Vendicated.Vencord"
+version = ""
+location = ""
+url = "https://winget.run/pkg/Vendicated/Vencord"
+sha256 = ""
+detect_name = ""
+order = 2
+
+[[programs]]
+key = "firefox"
+name = "Firefox"
+source = "winget"
+id = "Mozilla.Firefox"
+version = ""
+location = ""
+url = "https://winget.run/pkg/Mozilla/Firefox"
+sha256 = ""
+detect_name = ""
+order = 3
+
+[[programs]]
+key = "nvidia"
+name = "NVIDIA App"
+source = "msstore"
+id = "XP8CLZL93F5Z4P"
+version = ""
+location = ""
+url = "https://apps.microsoft.com/detail/XP8CLZL93F5Z4P"
+sha256 = ""
+detect_name = ""
+order = 4
+
+[[programs]]
+key = "claude"
+name = "Claude"
+source = "winget"
+id = "Anthropic.Claude"
+version = ""
+location = ""
+url = "https://winget.run/pkg/Anthropic/Claude"
+sha256 = ""
+detect_name = ""
+order = 5
+
+[[programs]]
+key = "telegram"
+name = "Telegram"
+source = "winget"
+id = "Telegram.TelegramDesktop"
+version = ""
+location = ""
+url = "https://winget.run/pkg/Telegram/TelegramDesktop"
+sha256 = ""
+detect_name = ""
+order = 6
+
+[[programs]]
+key = "git"
+name = "Git"
+source = "winget"
+id = "Git.Git"
+version = ""
+location = ""
+url = "https://winget.run/pkg/Git/Git"
+sha256 = ""
+detect_name = ""
+order = 7
+
+[[programs]]
+key = "armoury"
+name = "Armoury Crate"
+source = "winget"
+id = "Asus.ArmouryCrate"
+version = ""
+location = ""
+url = "https://winget.run/pkg/Asus/ArmouryCrate"
+sha256 = ""
+detect_name = ""
+order = 8
+
+[[programs]]
+key = "chrome"
+name = "Google Chrome"
+source = "winget"
+id = "Google.Chrome"
+version = ""
+location = ""
+url = "https://winget.run/pkg/Google/Chrome"
+sha256 = ""
+detect_name = ""
+order = 9
+
+[[programs]]
+key = "idea"
+name = "IntelliJ IDEA"
+source = "winget"
+id = "JetBrains.IntelliJIDEA"
+version = ""
+location = ""
+url = "https://winget.run/pkg/JetBrains/IntelliJIDEA"
+sha256 = ""
+detect_name = ""
+order = 10
+
+[[programs]]
+key = "translucent"
+name = "TranslucentTB"
+source = "winget"
+id = "CharlesMilette.TranslucentTB"
+version = ""
+location = ""
+url = "https://winget.run/pkg/CharlesMilette/TranslucentTB"
+sha256 = ""
+detect_name = ""
+order = 11
+
+[[programs]]
+key = "eartrumpet"
+name = "EarTrumpet"
+source = "winget"
+id = "File-New-Project.EarTrumpet"
+version = ""
+location = ""
+url = "https://winget.run/pkg/File-New-Project/EarTrumpet"
+sha256 = ""
+detect_name = ""
+order = 12
+
+[[programs]]
+key = "ngrok"
+name = "ngrok"
+source = "msstore"
+id = "9MVS1J51GMK6"
+version = ""
+location = ""
+url = "https://apps.microsoft.com/detail/9MVS1J51GMK6"
+sha256 = ""
+detect_name = ""
+order = 13
+
+# {data} заменяется выбранным диском
+[[paths]]
+key = "steam"
+path = '{data}\Steam'
+
+[[paths]]
+key = "main"
+path = '{data}\Main'
+
+[[paths]]
+key = "secondary"
+path = '{data}\Secondary'
+
+# Разрешённые изменения Windows; keep означает не менять
+[[windows_tweaks]]
+key = "max_refresh"
+name = "Максимальная частота"
+description = "Только частота, без изменения разрешения, HDR и масштаба"
+risk = "Осторожно"
+
+[[windows_tweaks]]
+key = "notify_snip"
+name = "Уведомления снимков экрана"
+description = "Разрешить или отключить уведомления приложения"
+risk = "Безопасно"
+
+[[windows_tweaks]]
+key = "notify_discord"
+name = "Уведомления Discord"
+description = "Только Windows-уведомления"
+risk = "Безопасно"
+
+[[windows_tweaks]]
+key = "notify_telegram"
+name = "Уведомления Telegram"
+description = "Только Windows-уведомления"
+risk = "Безопасно"
+
+[[windows_tweaks]]
+key = "suggestions"
+name = "Советы и предложения"
+description = "Советы, реклама и персонализированные предложения Windows"
+risk = "Безопасно"
+
+# Пароль вводится только в интерфейсе
+[backup]
+firefox = true
+sources = []
+vault_path = ""
+
+# Установщики выполняются последовательно
+[execution]
+retries = 2
+minimum_free_gib = 5
+
+# Защитные подтверждения обязательны
+[safety]
+restore_point = true
+require_removal_confirmation = true
+

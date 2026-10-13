@@ -1,0 +1,691 @@
+let c, hash = '', raw = '', inv = {}, plan = null, run = null, hist = [], page = 'Главная', tab = 'Программы', dirty = false, mode = 'choose', query = '', firstPlan = true, loading = false, external = false, autoFlagUsed = false;
+const app = document.querySelector('#app'), dlg = document.querySelector('#dialog');
+const api = (op, payload = {}) => window.__TAURI__.core.invoke('api', { op, payload });
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const btn = (label, action, cls = '', extra = '') => `<button data-action="${action}" class="${cls}" ${extra}>${label}</button>`;
+const badge = (risk = 'Безопасно') => `<span class="badge ${risk === 'Высокий риск' ? 'high' : risk === 'Осторожно' ? 'risk' : ''}">${esc(risk)}</span>`;
+const p = () => c.profiles.find((p) => p.name === c.application.selected_profile);
+const sel = (values, current) => values.map(s => `<option value="${esc(s)}" ${s === current ? 'selected' : ''}>${esc(s)}</option>`).join('');
+const status = (s) => ({ pending: 'Ожидает', running: 'Выполняется', succeeded: 'Готово', skipped: 'Пропущено', failed: 'Ошибка', interrupted: 'Прервано', awaiting_confirm: 'Ожидает подтверждения' }[s] || s);
+function toast(s) { const e = document.querySelector('#toast'); e.textContent = String(s); e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 9000); }
+function modal(title, body, yes = 'Подтвердить') { dlg.innerHTML = `<h2>${esc(title)}</h2><div class="modal-body">${body}</div><div class="row modal-buttons"><button id="no">Отмена</button><button id="yes" class="primary">${esc(yes)}</button></div>`; dlg.showModal(); return new Promise(resolve => { const finish = (v) => { dlg.close(); resolve(v); }; dlg.querySelector('#no').addEventListener('click', () => finish(false)); dlg.querySelector('#yes').addEventListener('click', () => finish(true)); dlg.oncancel = () => finish(false); dlg.onclick = e => { if (e.target === dlg)
+    finish(false); }; }); }
+async function ask(title, value = '') { if (!await modal(title, `<input id="answer" value="${esc(value)}" style="width:100%">`, 'Сохранить'))
+    return null; return dlg.querySelector('#answer').value.trim(); }
+async function load() { const x = await api('get'); c = x.config; hash = x.hash; raw = x.text; hist = x.history; mode = x.auto ? (autoFlagUsed ? mode : 'auto') : (autoFlagUsed ? mode : c.application.ui_start_mode); autoFlagUsed = true; dirty = false; external = false; render(); }
+const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
+let uiPanelOpen = false, uiFocusReturn = null, notifyRunId = '', notifyWasActive = false;
+function theme() {
+    const light = c.application.theme === 'light' || (c.application.theme === 'system' && matchMedia('(prefers-color-scheme:light)').matches);
+    document.body.classList.toggle('light', light);
+    const colors = { blue: light ? '#185c9d' : '#80b8ef', teal: light ? '#007b80' : '#5dcecf', violet: light ? '#6540ae' : '#b49bff', green: light ? '#287341' : '#84d5a0', orange: light ? '#a3510a' : '#ecb478', rose: light ? '#ac4169' : '#f3a0bd' };
+    document.documentElement.style.setProperty('--accent', colors[c.application.ui_accent] || colors.blue);
+    document.documentElement.style.setProperty('--ui-scale', String((c.application.ui_scale || 100) / 100));
+    document.body.classList.toggle('compact', c.application.ui_density === 'compact');
+    const reduce = !c.application.ui_animations || c.application.ui_reduce_motion || motionQuery.matches;
+    document.body.classList.toggle('reduce-motion', reduce);
+    const mult = { fast: .75, normal: 1, smooth: 1.2 }[c.application.ui_anim_speed] || 1;
+    for (const [key, value] of Object.entries({ '--ui-fast': 125 * mult + 'ms', '--ui-page': 175 * mult + 'ms', '--ui-panel': 200 * mult + 'ms' }))
+        document.documentElement.style.setProperty(key, reduce ? '0ms' : value);
+}
+matchMedia('(prefers-color-scheme:light)').addEventListener('change', () => { if (c)
+    theme(); });
+window.addEventListener('focus', () => { if (c)
+    theme(); });
+motionQuery.addEventListener('change', () => { if (c)
+    theme(); });
+function footer() { return `<div class="sidebar-footer"><small>Локально. Под вашим контролем.</small><button data-action="ui-open" class="gear-button" type="button" aria-label="Настройки программы" title="Настройки программы"><svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 8.7a3.3 3.3 0 1 0 0 6.6 3.3 3.3 0 0 0 0-6.6Z"/><path d="M19.4 13.4a8 8 0 0 0 0-2.8l2-1.5-2-3.4-2.3.9a8 8 0 0 0-2.4-1.4L14.4 2h-4.8l-.3 3.2a8 8 0 0 0-2.4 1.4l-2.3-.9-2 3.4 2 1.5a8 8 0 0 0 0 2.8l-2 1.5 2 3.4 2.3-.9a8 8 0 0 0 2.4 1.4l.3 3.2h4.8l.3-3.2a8 8 0 0 0 2.4-1.4l2.3.9 2-3.4-2-1.5Z"/></svg></button><small>Автор: TheMorgxx</small><small>Использование в незаконных или вредоносных целях и продажа программы запрещены. <button type="button" class="inline-link" data-action="about-open">Подробнее</button></small></div>`; }
+function uiChoices(key, values, selected) { return `<select data-ui="${key}">${values.map(([v, t]) => `<option value="${v}" ${v === selected ? 'selected' : ''}>${t}</option>`).join('')}</select>`; }
+function uiSettings() { const a = c.application; return `<div class="ui-panel-backdrop" data-action="ui-close"></div><section class="ui-panel" role="dialog" aria-modal="true" aria-label="Настройки программы"><div class="ui-panel-heading"><h2>Настройки программы</h2><button type="button" data-action="ui-close" aria-label="Закрыть настройки">✕</button></div><div class="ui-panel-content"><h3>Внешний вид</h3><label>Тема${uiChoices('theme', [['system', 'Системная'], ['light', 'Светлая'], ['dark', 'Тёмная']], a.theme)}</label><label>Акцентный цвет${uiChoices('ui_accent', [['blue', 'Синий'], ['teal', 'Бирюзовый'], ['violet', 'Фиолетовый'], ['green', 'Зелёный'], ['orange', 'Оранжевый'], ['rose', 'Розовый']], a.ui_accent)}</label><label>Масштаб интерфейса${uiChoices('ui_scale', [['90', '90%'], ['100', '100%'], ['110', '110%'], ['125', '125%']], String(a.ui_scale))}</label><label>Плотность${uiChoices('ui_density', [['normal', 'Обычная'], ['compact', 'Компактная']], a.ui_density)}</label><h3>Анимации</h3><label class="ui-check"><input type="checkbox" data-ui="ui_animations" ${a.ui_animations ? 'checked' : ''}> Анимации</label><label>Скорость${uiChoices('ui_anim_speed', [['fast', 'Быстро'], ['normal', 'Обычно'], ['smooth', 'Плавно']], a.ui_anim_speed)}</label><label class="ui-check"><input type="checkbox" data-ui="ui_reduce_motion" ${a.ui_reduce_motion ? 'checked' : ''}> Уменьшить движение</label><small>Системный параметр уменьшения движения Windows также учитывается автоматически.</small><h3>Разработка</h3><label class="ui-check"><input type="checkbox" data-ui="dev_mode" ${a.dev_mode ? "checked" : ""} ${dev?.active ? "disabled" : ""}> Режим разработчика</label><small>Добавляет раздел «Тесты» в боковую панель.</small><h3>Поведение</h3><label>При запуске открывать${uiChoices('ui_start_mode', [['choose', 'Выбор режима'], ['full', 'Полный интерфейс'], ['auto', 'Автоматический']], a.ui_start_mode)}</label><label class="ui-check"><input type="checkbox" data-ui="ui_confirm_close" ${a.ui_confirm_close ? 'checked' : ''}> Подтверждать закрытие во время выполнения</label><label class="ui-check"><input type="checkbox" data-ui="ui_notify_done" ${a.ui_notify_done ? 'checked' : ''}> Сообщать о завершении выполнения (звук)</label><div class="ui-reset"><button type="button" class="primary" data-action="ui-save">Сохранить настройки</button> <button type="button" data-action="ui-reset">Сбросить настройки интерфейса</button></div></div></section>`; }
+function openUi() { if (uiPanelOpen)
+    return; uiPanelOpen = true; uiFocusReturn = document.activeElement; document.body.insertAdjacentHTML('beforeend', uiSettings()); document.querySelector('.ui-panel button')?.focus(); }
+function closeUi() { document.querySelector('.ui-panel')?.remove(); document.querySelector('.ui-panel-backdrop')?.remove(); uiPanelOpen = false; if (uiFocusReturn?.isConnected)
+    uiFocusReturn.focus();
+else
+    document.querySelector('[data-action="ui-open"]')?.focus(); uiFocusReturn = null; }
+function about() { const version = window.__WINSETUP_VERSION__ || 'Не определена'; return modal('О программе', `<p>Версия: ${esc(version)}</p><p>Автор: TheMorgxx</p><p>© 2026 TheMorgxx</p><p>Программа создана и принадлежит TheMorgxx. Запрещено использовать её для незаконных или вредоносных целей, а также продавать и распространять за деньги.</p>`, 'Закрыть'); }
+function isRunning() { return !!run?.active || !!dev?.active; }
+function notifyDone(prev, next) { if (!c?.application.ui_notify_done || !prev?.active || next?.active || !next?.finished || prev.id !== next.id)
+    return; try {
+    const audio = new AudioContext();
+    const osc = audio.createOscillator(), gain = audio.createGain();
+    osc.connect(gain);
+    gain.connect(audio.destination);
+    osc.frequency.value = 660;
+    gain.gain.value = .025;
+    osc.start();
+    osc.stop(audio.currentTime + .13);
+    osc.onended = () => { void audio.close(); };
+}
+catch {
+    toast('Выполнение завершено');
+} }
+window.addEventListener('beforeunload', e => { if (c?.application.ui_confirm_close && isRunning()) {
+    e.preventDefault();
+    e.returnValue = '';
+} });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && uiPanelOpen) {
+    e.preventDefault();
+    closeUi();
+    return;
+} if (e.key !== 'Tab' || !uiPanelOpen)
+    return; const panel = document.querySelector('.ui-panel'); const els = Array.from(panel?.querySelectorAll('button,select,input,[tabindex]:not([tabindex="-1"])') || []).filter(x => !x.hasAttribute('disabled')); if (!els.length)
+    return; const first = els[0], last = els[els.length - 1]; if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+}
+else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+} });
+function profileSelect() { return `<select id="profile">${sel(c.profiles.map((x) => x.name), c.application.selected_profile)}</select>`; }
+function readiness() { if (!inv.disks)
+    return `<p>Проверка доступности…</p>`; return `<div class="grid">${[['Права администратора', inv.admin], ['Интернет', inv.internet], ['winget', inv.winget], ['Git', inv.git]].map(([n, v]) => `<div><small>${n}</small><div class="${v ? 'good' : 'risk'}">${v ? 'Доступно' : 'Не найдено / недоступно'}</div></div>`).join('')}</div><div class="row item"><label>Диск данных <select id="drive"><option value="">Выберите диск</option>${(inv.disks || []).map((d) => `<option value="${d.DeviceID}" ${c.application.data_drive === d.DeviceID ? 'selected' : ''}>${d.DeviceID} — ${(d.FreeSpace / 1073741824).toFixed(1)} ГиБ свободно</option>`).join('')}</select></label><small>${esc(inv.windows)} · ${esc(inv.version)} · ${esc(inv.build)}</small></div>`; }
+function planTable(q) { return `<div class="warn">Предпросмотр ничего не применяет. Установки и удаления не откатываются автоматически.</div>${q.warnings.map((w) => `<p class="risk">${esc(w)}</p>`).join('')}<div class="scroll"><table><thead><tr><th>Действие</th><th>Риск</th><th>Обратимость</th></tr></thead><tbody>${q.tasks.map((t) => `<tr><td>${esc(t.name)}</td><td>${badge(t.risk)}</td><td>${esc(t.reversible)}</td></tr>`).join('')}</tbody></table></div>`; }
+function progress() { if (!run)
+    return '<p>Запусков пока нет.</p>'; const done = run.tasks.filter((t) => ['succeeded', 'skipped', 'failed'].includes(t.status)).length; const held = run.tasks.filter((t) => t.status === 'awaiting_confirm'), pt = run.tasks.find((t) => t.action.kind === 'RestorePoint'); return `<strong>${done} из ${run.tasks.length} задач</strong><div class="ui-progress-track" role="progressbar" aria-label="Прогресс выполнения" aria-valuemin="0" aria-valuemax="${run.tasks.length}" aria-valuenow="${done}"><div class="ui-progress-fill" style="transform:scaleX(${run.tasks.length ? done / run.tasks.length : 0})"></div></div>${run.active ? '<span class="ui-running" role="status">Идёт выполнение</span>' : ''}${held.length ? `<div class="warn">Точка восстановления не создана${pt?.detail ? ': ' + esc(pt.detail) : ''}. Твики Windows и удаление встроенных приложений (${held.length}) ожидают подтверждения продолжить без точки. Остальные этапы выполняются как обычно.</div>` : ''}<p>${esc(run.tasks.find((t) => t.status === 'running')?.name || (run.finished ? 'Выполнение завершено' : run.active ? 'Ожидание' : 'Выполнение остановлено'))}</p><div class="row">${btn(run.paused ? 'Продолжить' : 'Пауза', 'pause', '', !run.active ? 'disabled' : '')}${btn('Отмена', 'cancel', '', !run.active ? 'disabled' : '')}${!run.active ? btn('Повторить ошибочные / продолжить', 'resume', '', 'data-id="' + run.id + '"') : ''}${!run.active && held.length ? btn('Продолжить без точки восстановления', 'resume-no-point', 'primary', 'data-id="' + run.id + '"') : ''}</div><details><summary>Журнал</summary><pre>${esc(run.log.join('\n'))}</pre></details>`; }
+function field(section, index, key, label, type = 'text') { const val = c[section][index][key]; return `<label>${esc(label)}<input type="${type}" data-section="${section}" data-index="${index}" data-field="${key}" value="${esc(val)}"></label>`; }
+function selected(group, id) { return p()[group].includes(id); }
+function check(group, id) { return `<input type="checkbox" data-group="${group}" data-id="${esc(id)}" ${selected(group, id) ? 'checked' : ''}>`; }
+function programs() { return `<p>Установщики запускаются по одному. Каталог задаётся только там, где поддерживается установщиком. ${badge('Осторожно')}</p>${btn('Добавить программу', 'add-program')}${c.programs.map((x, i) => `<div class="item searchable" data-search="${esc(x.name.toLowerCase())}"><div class="row between"><label>${check('programs', x.key)}<strong>${esc(x.name)}</strong><small>${esc(x.source)} · ${esc(x.id)}</small></label>${x.key === 'vencord' ? btn('Переустановить Vencord', 'vencord') : ''}</div><details><summary>Параметры установки</summary><div class="fields">${field('programs', i, 'name', 'Название')}<label>Источник<select data-section="programs" data-index="${i}" data-field="source">${sel(['winget', 'msstore', 'direct', 'git'], x.source)}</select></label>${field('programs', i, 'id', 'Точный ID')}${field('programs', i, 'version', 'Версия (необязательно)')}${field('programs', i, 'location', 'Каталог: {data}\\Имя')}${field('programs', i, 'order', 'Порядок', 'number')}${field('programs', i, 'url', 'HTTPS-ссылка / ручная установка')}${field('programs', i, 'sha256', 'SHA-256 (обязателен для direct)')}${field('programs', i, 'detect_name', 'Имя в списке установленных (direct)')}</div><p>Прямые загрузки: только MSI с проверкой SHA-256, без произвольных аргументов.</p>${btn('Страница для ручной установки', 'manual', 'link', `data-key="${esc(x.key)}"`)}</details></div>`).join('')}<div class="card"><h3>Драйвер чипсета AMD B550</h3><p>ASUS PRIME B550M-K. Загрузка и установка только вручную.</p>${btn('Открыть официальную страницу', 'driver')}</div>`; }
+function folders() { return `<p>Создаются только отсутствующие папки. Существующие не изменяются. ${badge()}</p>${btn('Добавить папку', 'add-folder')}${c.paths.map((x, i) => `<div class="item searchable" data-search="${esc(x.path.toLowerCase())}"><label>${check('paths', x.key)}<strong>▸ ${esc(x.path)}</strong></label><div class="fields">${field('paths', i, 'path', 'Полный путь / {data}\\папка')}</div></div>`).join('')}`; }
+function tweaks() { const states = [['keep', 'Не менять'], ['enabled', 'Включить'], ['disabled', 'Выключить']]; return `<p>Перед применением сохраняются значения для отката и создаётся точка восстановления.</p>${c.windows_tweaks.map((x) => `<div class="item searchable" data-search="${esc((x.name + ' ' + x.description).toLowerCase())}"><div class="row between"><strong>${esc(x.name)}</strong>${badge(x.risk)}<select data-tweak="${x.key}">${states.map(([v, n]) => `<option value="${v}" ${(p().windows_tweaks[x.key] || 'keep') === v ? 'selected' : ''}>${n}</option>`).join('')}</select></div><p>${esc(x.description)}</p>${x.key === 'max_refresh' ? `<small>${(inv.displays || []).map((d) => `${esc(d.device)}: ${d.width}×${d.height}, сейчас ${d.current}, максимум ${d.maximum} Гц`).join('<br>')}</small>` : ''}</div>`).join('')}<div class="warn">Заблокированы: Defender, UAC, брандмауэр, Windows Update, SmartScreen, службы пакетом, hosts, BCD, файл подкачки, эффекты, анимации, масштаб, HDR и план питания. Конфиг с такими действиями будет отклонён.</div>`; }
+function appx() { const apps = inv.apps || []; const allowed = (a) => !a.IsFramework && !a.NonRemovable && a.SignatureKind !== 4 && (c.appx_removal.includes(a.Name) || a.Name.startsWith('Microsoft.LanguageExperiencePack')); return `<p>Только реально найденные пакеты текущего пользователя. ${badge('Высокий риск')}</p><div class="warn">Удаление частично обратимо. Перед запуском потребуется отдельное подтверждение.</div>${apps.filter(allowed).map((a) => `<div class="item searchable" data-search="${esc(a.Name.toLowerCase())}"><label>${check('appx_removal', a.Name)}${esc(a.Name)}</label></div>`).join('') || '<p>Доступные пакеты не найдены.</p>'}<details><summary>Защищённые пакеты — удаление заблокировано (${apps.filter((a) => !allowed(a)).length})</summary><p>Системные компоненты, Store, установщик приложений, кодеки, калькулятор и другие пакеты вне разрешённого списка.</p><pre>${esc(apps.filter((a) => !allowed(a)).map((a) => a.Name).join('\n'))}</pre></details>`; }
+function startup() { return `<p>Отметьте записи, которые хотите отключить. Записи не удаляются; сохраняется StartupApproved для отката. ${badge('Осторожно')}</p>${(inv.startup || []).map((a) => `<div class="item searchable" data-search="${esc(a.name.toLowerCase())}"><label>${check('autostart', a.key)}<strong>${esc(a.name)}</strong><small>${a.disabled ? 'Уже отключено' : 'Не отмечено как отключённое'} · ${esc(a.hive)}</small></label><small>${esc(a.path)}</small></div>`).join('') || '<p>Записи не найдены.</p>'}`; }
+function backup() { return `<p>Data Vault: Argon2id + AES-256-GCM. Пароль не сохраняется. ${badge('Осторожно')}</p><label><input id="backup-firefox" type="checkbox" ${c.backup.firefox ? 'checked' : ''}> Firefox: профили и profiles.ini без кэша и lock-файлов</label><p>Перед созданием или восстановлением закройте Firefox.</p>${btn('Добавить источник', 'add-backup')}${c.backup.sources.map((x, i) => `<div class="fields"><label>Имя источника <input data-backup="${i}" data-field="key" value="${esc(x.key)}"></label><label>Путь <input data-backup="${i}" data-field="path" value="${esc(x.path)}"></label></div>`).join('')}<div class="card"><label>Файл .wsvault <input id="vault-path" value="${esc(c.backup.vault_path)}" style="width:100%"></label><div class="row">${btn('Выбрать файл', 'vault-browse')}${btn('Создать бэкап', 'vault-create', 'primary')}${btn('Восстановить', 'vault-restore')}</div><p><label><input id="restore-in-plan" type="checkbox" ${p().restore_backup ? 'checked' : ''}> Восстанавливать этот архив в конце плана</label></p></div><div class="card"><h3>Подготовиться к переустановке</h3><p>Выберите папку на флешке. Будет создан комплект: exe, winsetup.toml и проверенный .wsvault.</p>${btn('Подготовиться к переустановке', 'vault-prepare', 'primary')}</div>`; }
+function repos() { return `<p>HTTPS, приватные — через Git Credential Manager. Существующие папки пропускаются; скрипты и зависимости не запускаются. ${badge()}</p>${btn('Добавить репозиторий', 'add-repo')}${c.repositories.map((x, i) => `<div class="item searchable" data-search="${esc(x.url.toLowerCase())}"><label>${check('repositories', x.key)}${esc(x.url)}</label><div class="fields">${field('repositories', i, 'url', 'HTTPS URL без токена')}${field('repositories', i, 'target', 'Целевая папка')}${field('repositories', i, 'branch', 'Ветка (необязательно)')}</div></div>`).join('')}`; }
+function profiles() { return `<div class="row">${btn('Копировать выбранный', 'copy-profile')}${btn('Переименовать', 'rename-profile')}${btn('Удалить', 'delete-profile', 'danger')}${btn('Экспорт', 'export-profile')}${btn('Импорт', 'import-profile')}</div>${c.profiles.map((x) => `<div class="card"><div class="row between"><h3>${esc(x.name)}</h3>${btn('Выбрать', 'choose-profile', '', `data-name="${esc(x.name)}"`)}</div><p>${x.programs.length} программ · ${x.paths.length} папок · ${x.appx_removal.length} выбранных удалений</p></div>`).join('')}`; }
+function historyView() { return (hist.length ? btn('Откатить последний запуск', 'rollback', '', `data-id="${hist[0].id}"`) : '') + hist.map((r) => `<div class="card"><strong>${esc(r.plan.profile)}</strong><p>${esc(r.id)} · ${r.finished ? 'Завершено' : 'Есть незавершённые задачи'}</p><div class="row">${!r.finished ? btn('Продолжить / повторить ошибочные', 'resume', '', `data-id="${r.id}"`) : ''}${btn('Откатить настройки', 'rollback', '', `data-id="${r.id}"`)}${btn('Экспорт отчёта', 'export-report', '', `data-id="${r.id}"`)}</div><details><summary>Задачи</summary>${r.tasks.map((t) => `<p>${esc(t.name)} — ${status(t.status)}</p>`).join('')}</details></div>`).join('') || '<div class="empty">История появится после первого запуска.</div>'; }
+function settings() { return `<div class="fields"><label>Тема<select id="theme">${[['dark', 'Тёмная'], ['light', 'Светлая'], ['system', 'Системная']].map(([v, n]) => `<option value="${v}" ${c.application.theme === v ? 'selected' : ''}>${n}</option>`).join('')}</select></label><label>Повторные попытки<input type="number" id="retries" min="0" max="5" value="${c.execution.retries}"></label><label>Минимум свободного места, ГиБ<input type="number" id="min-space" min="1" value="${c.execution.minimum_free_gib}"></label></div><div class="card"><h3>Источник конфигурации</h3><input id="config-url" placeholder="https://raw.githubusercontent.com/…" style="width:100%">${btn('Загрузить и сравнить', 'remote')}<p>Изменения применяются только после показа разницы и подтверждения.</p></div><details><summary>Редактор winsetup.toml</summary><textarea id="toml" spellcheck="false">${esc(raw)}</textarea>${btn('Проверить и сохранить TOML', 'save-toml')}<p>Синтаксические ошибки указывают строку. При семантической ошибке указано начало раздела.</p></details><p>Передача паролей, токенов и произвольных команд через конфиг запрещена.</p>${btn('Вернуться к выбору режима', 'mode-choose', 'link')}`; }
+let devTests = [], dev = null, devSelected = new Set(), devExpanded = new Set(), devLevel = 'all', devHideUser = true, devPolling = false, devProfile = '';
+const devNames = { PASS: 'Пройден', FAIL: 'Ошибка', WARN: 'Предупреждение', SKIP: 'Пропущен' };
+let devReal = { tests: [], pending: [], startup: [], targets: {}, data_drive: '' };
+async function refreshDev() { devTests = await api('dev_list'); dev = await api('dev_state'); devReal = await api('dev_real_info'); devProfile = c.application.selected_profile; const ids = new Set(devTests.map(t => t.id)); devSelected = new Set([...devSelected].filter(id => ids.has(id))); }
+function realPanel() {
+    const pending = devReal.pending || [], busy = !!dev?.active || !!run?.active;
+    return `<section class="card"><h2>Реальные обратимые тесты</h2><p>Отдельный запуск временно отключает уведомления Telegram, советы Windows и одну выбранную запись автозапуска HKCU, затем возвращает исходные значения. На диске данных создаётся и удаляется только тестовая папка с нашим маркером.</p><p>Эта группа не входит в «Запустить все безопасные», «Запустить выбранные» и автоматическую диагностику. Снимок сохраняется до изменений и удаляется только после проверки полного возврата.</p>${pending.length ? `<div class="warn" role="alert"><strong style="font-size:1.15em">ВНИМАНИЕ: ОБНАРУЖЕНЫ СОХРАНЁННЫЕ СНИМКИ ОТКАТА</strong><p>Предыдущий возврат не подтверждён. Новые реальные тесты заблокированы.</p>${pending.map(p => `<details><summary>${esc(p.file)}${p.valid ? '' : ' — файл требует проверки'}</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(p.details)}</pre></details>`).join('')}${btn('Откатить сохранённые значения', 'dev-real-recover', '', busy ? 'disabled' : '')}</div>` : ''}<div class="row">${btn('Запустить реальные тесты', 'dev-real-run', '', busy || pending.length ? 'disabled' : '')}</div><p>Остановить можно между тестами. При тайм-ауте дальнейшее применение прекращается; возврат начатых изменений завершается и проверяется.</p></section>`;
+}
+function devView() {
+    const active = !!dev?.active, results = dev?.results || [], log = dev?.log || [];
+    const visible = [...devTests, ...(devReal.tests || [])];
+    for (const t of dev?.tests || [])
+        if (!visible.some(v => v.id === t.id))
+            visible.push(t);
+    return `<h2>Безопасные тесты</h2><p>Без установки программ и изменений Windows. Vault и файловые проверки работают во временной папке. Для сетевых проверок используются только winget show и git ls-remote.</p><div class="row">${btn('Запустить все безопасные', 'dev-all', 'primary', active ? 'disabled' : '')}${btn('Запустить выбранные', 'dev-selected', '', active || !devSelected.size ? 'disabled' : '')}${btn('Остановить', 'dev-stop', '', !active || dev?.stopping ? 'disabled' : '')}${btn('Копировать отчёт', 'dev-copy', '', !dev?.id ? 'disabled' : '')}${btn('Сохранить отчёт', 'dev-save', '', active || !dev?.id ? 'disabled' : '')}${btn('Открыть папку логов', 'dev-open')}</div><p><label><input type="checkbox" id="dev-hide-user" ${devHideUser ? 'checked' : ''}> Скрыть имя пользователя при копировании</label></p>${realPanel()}<p aria-live="polite">${active ? (dev?.stopping ? 'Остановка после текущего теста и возврата изменений…' : `Выполняется: ${esc(visible.find(t => t.id === dev?.current)?.name || 'Подготовка')}`) : dev?.id ? 'Диагностика завершена' : 'Выберите тесты или запустите все безопасные'}</p><div class="row">${Object.entries(devNames).map(([code, name]) => `<span class="badge" title="${name}">${code}: ${results.filter(r => r.status === code).length}</span>`).join('')}</div>${dev?.error ? `<div class="warn" role="alert">${esc(dev.error)}</div>` : ''}${dev?.report_path ? `<p>Отчёт: ${esc(dev.report_path)}</p>` : ''}<div class="scroll"><table><thead><tr><th><input type="checkbox" id="dev-select-all" aria-label="Выбрать все безопасные тесты" ${devTests.length && devTests.every(t => devSelected.has(t.id)) ? 'checked' : ''} ${active ? 'disabled' : ''}></th><th>Группа</th><th>Название и технический вывод</th><th>Статус</th><th>Время</th><th>Краткий результат</th></tr></thead><tbody>${visible.map(t => { const r = results.find(r => r.id === t.id); return `<tr><td>${t.group === 10 ? 'Отдельный запуск' : `<input type="checkbox" data-dev-test="${esc(t.id)}" aria-label="${esc(t.name)}" ${devSelected.has(t.id) ? 'checked' : ''} ${active ? 'disabled' : ''}>`}</td><td>${t.group === 10 ? 'Реальные обратимые тесты' : t.group}</td><td><details data-dev-detail="${esc(t.id)}" ${devExpanded.has(t.id) ? 'open' : ''}><summary>${esc(t.name)}</summary>${r?.summary?.includes('ВНИМАНИЕ') ? `<p class="warn" role="alert"><strong style="font-size:1.15em">${esc(r.summary)}</strong></p>` : ''}<pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(r?.technical || 'Технический вывод появится после проверки')}</pre></details></td><td>${r ? `${r.status} — ${devNames[r.status]}` : dev?.current === t.id ? 'Выполняется' : 'Ожидает'}</td><td>${r ? (r.elapsed_ms / 1000).toFixed(2) + ' с' : '—'}</td><td>${esc(r?.summary || '')}</td></tr>`; }).join('')}</tbody></table></div><h2>Живой журнал</h2><label>Уровень <select id="dev-level"><option value="all">Все</option>${Object.entries(devNames).map(([code, name]) => `<option value="${code}" ${devLevel === code ? 'selected' : ''}>${name} (${code})</option>`).join('')}</select></label><pre id="dev-log" style="max-height:320px;overflow:auto;white-space:pre-wrap">${esc(log.filter(l => devLevel === 'all' || l.level === devLevel).map(l => `${l.time} [${l.level}] ${l.message}`).join('\n'))}</pre><p>Отчёты сохраняются в папку logs рядом с приложением; остаются последние пять запусков. Снимки незавершённого отката из ротации исключены.</p>`;
+}
+async function runRealDialog() {
+    if (dirty) {
+        toast('Сначала сохраните или перечитайте настройки. Реальный тест не сохраняет winsetup.toml автоматически.');
+        return;
+    }
+    devReal = await api('dev_real_info', { startup: true });
+    renderDev();
+    if (devReal.pending?.length) {
+        toast('Сначала откатите сохранённые значения');
+        return;
+    }
+    const choices = devReal.startup || [];
+    const targetList = (id) => (devReal.targets?.[id] || []).map(([path, name]) => `<li><code>HKCU\\${esc(path)} → ${esc(name)}</code></li>`).join('');
+    const body = `<div class="warn"><strong>Будут реальные изменения текущего пользователя.</strong><p>Перед изменениями сохраняется снимок. После каждого теста выполняется возврат и проверка исходного состояния.</p></div><ol><li><strong>R1:</strong> уведомления Telegram — временно выключить, затем вернуть исходное значение.<ul>${targetList('R1')}</ul></li><li><strong>R2:</strong> все значения suggestions — временно 0, затем вернуть исходные значения.<details><summary>Полный список значений</summary><ul>${targetList('R2')}</ul></details></li><li><strong>R3:</strong> отключить одну включённую запись через StartupApproved, затем вернуть исходное значение. HKLM и SecurityHealth исключены.<label>Запись автозапуска<select id="real-startup" ${choices.length ? '' : 'disabled'}><option value="">${choices.length ? 'Выберите одну запись' : 'Нет подходящих записей — R3 будет пропущен'}</option>${choices.map(p => `<option value="${esc(p.key)}">${esc(p.name)} (${esc(p.category)}) — ${esc(p.command)}</option>`).join('')}</select></label>${devReal.startup_error ? `<p class="warn">Не удалось прочитать автозапуск: ${esc(devReal.startup_error)}. R3 будет пропущен.</p>` : ''}</li><li><strong>R4:</strong> ${devReal.data_drive ? `создать <code>${esc(devReal.data_drive)}\\WinSetupDevTest</code> и файл-маркер, повторить создание, удалить только собственную тестовую папку. Существующая папка не изменяется.` : 'Диск данных не выбран — R4 будет пропущен.'}</li></ol><p><label><input type="checkbox" id="real-understand"> Я понимаю, что будут реальные изменения</label></p>`;
+    const waiting = modal('Подтверждение реальных тестов', body, 'Запустить реальные тесты');
+    const yes = dlg.querySelector('#yes'), ack = dlg.querySelector('#real-understand'), select = dlg.querySelector('#real-startup');
+    const gate = () => { yes.disabled = !ack.checked || (choices.length > 0 && !select.value); };
+    gate();
+    ack.addEventListener('change', gate);
+    select.addEventListener('change', gate);
+    if (!await waiting || !ack.checked || (choices.length > 0 && !select.value))
+        return;
+    dev = await api('dev_real_run', { confirmed: true, startup_key: select.value || null });
+    renderDev();
+}
+async function recoverRealDialog() {
+    devReal = await api('dev_real_info');
+    renderDev();
+    if (!devReal.pending?.length) {
+        toast('Сохранённых снимков нет');
+        return;
+    }
+    if (!await modal('Откатить сохранённые значения?', `<p>Будут восстановлены исходные значения только из этих снимков под тем же пользователем. Собственная тестовая папка удаляется только при совпадении маркера и отсутствии чужих файлов. Непроверенные снимки сохранятся.</p>${devReal.pending.map((p) => `<details><summary>${esc(p.file)}</summary><pre style="white-space:pre-wrap">${esc(p.details)}</pre></details>`).join('')}`, 'Откатить сохранённые значения'))
+        return;
+    dev = await api('dev_real_recover', { confirmed: true });
+    renderDev();
+}
+function renderDev() { const host = document.querySelector('#dev-tests'); if (host) {
+    host.innerHTML = devView();
+    const select = host.querySelector('#dev-level');
+    if (select)
+        select.value = devLevel;
+} }
+async function devAction(action) {
+    if (action === 'dev-real-run') {
+        await runRealDialog();
+        return;
+    }
+    if (action === 'dev-real-recover') {
+        await recoverRealDialog();
+        return;
+    }
+    if (action === 'dev-all' || action === 'dev-selected') {
+        const selected = [...devSelected];
+        await before();
+        await refreshDev();
+        const ids = action === 'dev-all' ? devTests.map(t => t.id) : selected.filter(id => devTests.some(t => t.id === id));
+        if (!ids.length) {
+            toast('Выберите хотя бы один тест');
+            return;
+        }
+        dev = await api('dev_run', { ids });
+        renderDev();
+    }
+    else if (action === 'dev-stop') {
+        dev = await api('dev_stop');
+        renderDev();
+    }
+    else if (action === 'dev-copy') {
+        const report = await api('dev_state', { action: 'report', hide_user: devHideUser });
+        await navigator.clipboard.writeText(report);
+        toast('Отчёт скопирован');
+    }
+    else if (action === 'dev-save') {
+        toast('Отчёт сохранён: ' + await api('dev_state', { action: 'save' }));
+        dev = await api('dev_state');
+        renderDev();
+    }
+    else if (action === 'dev-open') {
+        await api('dev_state', { action: 'open_logs' });
+    }
+}
+document.addEventListener('toggle', ev => { const el = ev.target; if (!el.dataset.devDetail)
+    return; if (el.open)
+    devExpanded.add(el.dataset.devDetail);
+else
+    devExpanded.delete(el.dataset.devDetail); }, true);
+setInterval(async () => { if (devPolling || !c || (!c.application.dev_mode && !dev?.active))
+    return; devPolling = true; try {
+    if (page === 'Тесты' && devProfile !== c.application.selected_profile) {
+        await refreshDev();
+        renderDev();
+    }
+    else {
+        const next = await api('dev_state');
+        if (JSON.stringify(next) !== JSON.stringify(dev)) {
+            const finished = !!dev?.active && !next?.active;
+            dev = next;
+            if (finished)
+                devReal = await api('dev_real_info');
+            renderDev();
+        }
+    }
+}
+catch (e) {
+    toast(e);
+}
+finally {
+    devPolling = false;
+} }, 750);
+function render() {
+    if (!c)
+        return;
+    theme();
+    if (mode === 'choose') {
+        app.innerHTML = `<main class="choose"><small>WINSETUP / WINDOWS 10</small><h1>Ваше окружение, снова на месте.</h1><p>Выберите, как подготовить этот компьютер. Любой запуск начинается с плана.</p><div class="grid"><div class="card"><h2>Полный интерфейс</h2><p>Настройте каждый шаг и изучите результат.</p>${btn('Открыть настройки', 'mode-full', 'primary')}</div><div class="card"><h2>Автоматический</h2><p>Выберите профиль и запустите готовый план.</p>${btn('Выбрать профиль', 'mode-auto', 'primary')}</div></div>${readiness()}</main>`;
+        return;
+    }
+    const save = dirty ? `<div class="savebar row between"><span>${external ? 'Файл изменён снаружи. Перечитайте, чтобы не потерять изменения.' : 'Есть несохранённые изменения'}</span><span>${btn('Сохранить', 'save', 'primary')}${btn('Перечитать файл', 'reload')}</span></div>` : '';
+    if (mode === 'auto') {
+        app.innerHTML = `<main class="auto"><header><h1>WinSetup</h1>${badge('Осторожно')}</header>${save}<div class="card"><label>Профиль ${profileSelect()}</label><p><label><input id="first-plan" type="checkbox" ${firstPlan ? 'checked' : ''}> Сначала показать план</label></p>${btn('Запуск', 'launch', 'primary', run?.active ? 'disabled' : '')}<p>Не закрывайте приложение во время установки.</p></div>${!c.application.data_drive ? `<div class="card">${readiness()}</div>` : ''}${!run && hist.some(h => !h.finished) ? `<div class="warn">Есть незавершённый запуск. ${btn('Продолжить', 'resume', '', `data-id="${hist.find(h => !h.finished).id}"`)}</div>` : ''}<div id="progress">${progress()}</div>${btn('Открыть полный интерфейс', 'mode-full', 'link')}</main>`;
+        return;
+    }
+    const nav = ['Главная', 'Профили', 'Настройка', 'Выполнение', 'История', 'Параметры', ...(c.application.dev_mode ? ['Тесты'] : [])];
+    if (page === 'Тесты' && !c.application.dev_mode)
+        page = 'Главная';
+    let content = '';
+    if (page === 'Главная') {
+        const pp = p();
+        content = `<div class="card">${readiness()}</div><div class="card"><h2>План профиля</h2><p>${pp.programs.length} программ · ${pp.paths.length} папок · ${Object.values(pp.windows_tweaks).filter(v => v !== 'keep').length} твиков · до ${pp.appx_removal.length} удалений · ${pp.repositories.length} репозиториев</p><div class="row">${btn('Предпросмотр', 'preview')}${btn('Запустить', 'launch', 'primary', run?.active ? 'disabled' : '')}</div></div>${hist.some(h => !h.finished) ? '<div class="warn">Есть незавершённый запуск. Продолжение доступно в разделе «История».</div>' : ''}${btn('Автоматический режим', 'mode-auto', 'link')}`;
+    }
+    else if (page === 'Настройка') {
+        const tabs = ['Программы', 'Папки', 'Windows', 'Встроенные приложения', 'Автозапуск', 'Бэкап', 'Репозитории'];
+        content = `<div class="tabs">${tabs.map(t => btn(t, 'tab', t === tab ? 'active' : '', `data-tab="${t}"`)).join('')}</div>` + ({ 'Программы': programs, 'Папки': folders, 'Windows': tweaks, 'Встроенные приложения': appx, 'Автозапуск': startup, 'Бэкап': backup, 'Репозитории': repos }[tab] || programs)();
+    }
+    else if (page === 'Профили')
+        content = profiles();
+    else if (page === 'История')
+        content = historyView();
+    else if (page === 'Параметры')
+        content = settings();
+    else if (page === 'Тесты')
+        content = `<section id="dev-tests">${devView()}</section>`;
+    else
+        content = `<div id="progress">${progress()}</div><label>Фильтр журнала <input id="log-filter" placeholder="Поиск по сообщениям"></label><label><input type="checkbox" id="technical"> Технический журнал stdout/stderr</label><pre id="logs"></pre>${run ? `<div class="scroll"><table>${run.tasks.map((t) => `<tr><td>${esc(t.name)}</td><td>${status(t.status)}</td><td>${esc(t.detail)}</td></tr>`).join('')}</table></div>` : ''}`;
+    app.innerHTML = `<aside><div class="brand">WinSetup<span class="muted">.</span></div>${nav.map(n => btn(n, 'page', n === page ? 'active' : '', `data-page="${n}"`)).join('')}${footer()}</aside><main class="full">${save}<header><div><h1>${esc(page)}</h1><small>Профиль ${profileSelect()}</small></div><input class="search" id="search" placeholder="Поиск по настройкам" value="${esc(query)}"></header><div id="search-results"></div>${content}</main>`;
+    filter();
+    logs();
+}
+function filter() { const results = document.querySelector('#search-results'); if (results) {
+    const data = [];
+    for (const x of c.programs)
+        data.push(['Программы', x.name]);
+    for (const x of c.paths)
+        data.push(['Папки', x.path]);
+    for (const x of c.windows_tweaks)
+        data.push(['Windows', x.name]);
+    for (const x of inv.apps || [])
+        data.push(['Встроенные приложения', x.Name]);
+    for (const x of inv.startup || [])
+        data.push(['Автозапуск', x.name]);
+    for (const x of c.repositories)
+        data.push(['Репозитории', x.url]);
+    results.innerHTML = query ? `<div class="card"><small>Результаты поиска</small><div class="row">${data.filter(([, n]) => n.toLowerCase().includes(query.toLowerCase())).slice(0, 12).map(([t, n]) => btn(esc(n), 'tab', '', `data-tab="${t}"`)).join('') || 'Совпадений нет'}</div></div>` : '';
+} document.querySelectorAll('.searchable').forEach(e => e.hidden = !(e.dataset.search || '').includes(query.toLowerCase())); }
+function logs() { const el = document.querySelector('#logs'); if (!el || !run)
+    return; const technical = document.querySelector('#technical')?.checked; const q = document.querySelector('#log-filter')?.value.toLowerCase() || ''; el.textContent = (technical ? run.technical : run.log).filter((s) => s.toLowerCase().includes(q)).join('\n'); }
+async function save() { await api('save', { config: c, expected: hash }); await load(); plan = null; }
+async function before() { if (dirty)
+    await save(); }
+async function getPlan() { await before(); plan = await api('plan', { profile: c.application.selected_profile }); return plan; }
+async function launch(resume, noPoint = false) { const q = await getPlan(); let noPointOk = false; if (noPoint) {
+    const old = run && run.id === resume ? run : hist.find(h => h.id === resume);
+    const held = (old?.tasks || []).filter((t) => t.status === 'awaiting_confirm');
+    if (!held.length) {
+        toast('Нет этапов, ожидающих подтверждения');
+        return;
+    }
+    noPointOk = await modal('Продолжить без точки восстановления?', `<div class="warn">Точка восстановления не создана, откат Windows к ней будет невозможен. Удаление встроенных приложений автоматически не откатывается.</div><p>Будут выполнены:</p><pre>${esc(held.map((t) => t.name).join('\n'))}</pre>`, 'Продолжить без точки');
+    if (!noPointOk)
+        return;
+} if (!noPoint && (mode !== 'auto' || firstPlan || resume)) {
+    if (!await modal(resume ? 'Продолжить незавершённый запуск' : 'План выполнения', planTable(q), 'Перейти к запуску'))
+        return;
+} const removals = q.tasks.filter((t) => t.action.kind === 'Remove'); let confirmed = false; if (removals.length && noPointOk) {
+    confirmed = true;
+}
+else if (removals.length) {
+    confirmed = await modal('Подтвердите удаление встроенных приложений', `<p>Только текущий пользователь. Автоматического возврата из Store нет.</p><pre>${esc(removals.map((t) => t.name).join('\n'))}</pre>`, 'Подтверждаю удаление');
+    if (!confirmed)
+        return;
+} let password = ''; const gated = q.tasks.some((t) => ['Tweak', 'Remove'].includes(t.action.kind)); const box = mode === 'auto' && gated && !noPointOk ? '<p><label><input id="no-point" type="checkbox"> Если точку восстановления создать не удастся — продолжить твики Windows и удаление встроенных приложений без неё</label></p>' : ''; if (p().restore_backup) {
+    if (!await modal('Пароль Data Vault', '<p>Firefox должен быть закрыт. Существующие данные сохранятся в .bak.</p><input id="password" type="password" autocomplete="off">' + box, 'Начать'))
+        return;
+    const el = dlg.querySelector('#password');
+    password = el.value;
+    el.value = '';
+}
+else if (!noPointOk && !await modal('Начать выполнение?', `<p>${q.tasks.length} задач. Перед изменениями будет создана точка восстановления. Если она не создастся, твики Windows и удаление встроенных приложений будут ждать вашего подтверждения. Запускайте UAC под тем же пользователем, чьи настройки переносите.</p>${box}`, 'Запустить'))
+    return; if (box && dlg.querySelector('#no-point')?.checked)
+    noPointOk = true; await api('start', { confirm_removal: confirmed, password, resume, no_point_ok: noPointOk }); password = ''; page = 'Выполнение'; run = await api('state'); render(); }
+async function doVault(mode) { await before(); const kind = mode === 'prepare' ? 'folder' : mode === 'create' ? 'save' : 'open'; const path = await api('browse', { kind }); if (!path)
+    return; if (!await modal(mode === 'restore' ? 'Восстановление' : 'Пароль Data Vault', '<p>Не менее 8 символов. Пароль не сохраняется. Firefox должен быть закрыт.</p><input id="password" type="password" autocomplete="new-password"><p>Дождитесь проверки целостности. Во время операции не закрывайте приложение.</p>', 'Продолжить'))
+    return; const el = dlg.querySelector('#password'); let password = el.value; el.value = ''; toast('Data Vault: обработка и проверка файлов…'); try {
+    toast(await api('vault', { mode, path: mode === 'create' && !path.endsWith('.wsvault') ? path + '.wsvault' : path, password, confirmed: true }));
+}
+finally {
+    password = '';
+} }
+document.addEventListener('click', async (ev) => { const el = ev.target.closest('[data-action]'); if (!el)
+    return; const a = el.dataset.action; try {
+    if (a?.startsWith('dev-')) {
+        await devAction(a);
+    }
+    else if (a === 'ui-open') {
+        openUi();
+    }
+    else if (a === 'ui-close') {
+        closeUi();
+    }
+    else if (a === 'ui-save') {
+        await save();
+        closeUi();
+        toast('Настройки программы сохранены');
+    }
+    else if (a === 'about-open') {
+        await about();
+    }
+    else if (a === 'ui-reset') {
+        if (await modal('Сбросить настройки интерфейса?', '<p>Будут восстановлены стандартные значения оформления, анимаций и поведения.</p>', 'Сбросить')) {
+            Object.assign(c.application, { theme: 'dark', ui_accent: 'blue', ui_scale: 100, ui_density: 'normal', ui_animations: true, ui_anim_speed: 'normal', ui_reduce_motion: false, ui_start_mode: 'choose', ui_confirm_close: true, ui_notify_done: true });
+            dirty = true;
+            theme();
+            closeUi();
+            render();
+        }
+    }
+    else if (a === 'page') {
+        page = el.dataset.page;
+        if (page === 'История')
+            hist = await api('history');
+        if (page === 'Тесты')
+            await refreshDev();
+        render();
+    }
+    else if (a === 'tab') {
+        tab = el.dataset.tab;
+        page = 'Настройка';
+        render();
+    }
+    else if (a === 'save') {
+        await save();
+        toast('Сохранено');
+    }
+    else if (a === 'reload') {
+        if (!dirty || await modal('Перечитать файл?', '<p>Несохранённые правки в интерфейсе будут отброшены.</p>'))
+            await load();
+    }
+    else if (a?.startsWith('mode-')) {
+        mode = a.slice(5);
+        c.application.mode = mode;
+        dirty = true;
+        await save();
+        await api('resize', { auto: mode === 'auto' });
+    }
+    else if (a === 'preview') {
+        const q = await getPlan();
+        await modal('Предпросмотр — только чтение', planTable(q), 'Закрыть');
+    }
+    else if (a === 'launch')
+        await launch();
+    else if (a === 'resume') {
+        const r = hist.find(h => h.id === el.dataset.id) || run;
+        if (r) {
+            c.application.selected_profile = r.plan.profile;
+            await launch(r.id);
+        }
+    }
+    else if (a === 'resume-no-point') {
+        const r = run && run.id === el.dataset.id ? run : hist.find(h => h.id === el.dataset.id);
+        if (r) {
+            c.application.selected_profile = r.plan.profile;
+            await launch(r.id, true);
+        }
+    }
+    else if (a === 'pause') {
+        await api('pause', { value: !run?.paused });
+        run = await api('state');
+        render();
+    }
+    else if (a === 'cancel') {
+        toast(await api('cancel'));
+    }
+    else if (a === 'driver')
+        await api('open_driver');
+    else if (a === 'manual')
+        await api('open_manual', { key: el.dataset.key });
+    else if (a === 'vencord') {
+        await before();
+        if (await modal('Переустановить Vencord?', '<p>Будет запущен установщик Vencord после проверки Discord.</p>')) {
+            await api('vencord', { confirmed: true });
+            page = 'Выполнение';
+            render();
+        }
+    }
+    else if (a === 'copy-profile' || a === 'rename-profile') {
+        const name = await ask(a === 'copy-profile' ? 'Имя копии профиля' : 'Новое имя', p().name + (a === 'copy-profile' ? ' — копия' : ''));
+        if (name) {
+            if (a === 'copy-profile') {
+                const cp = structuredClone(p());
+                cp.name = name;
+                c.profiles.push(cp);
+            }
+            else
+                p().name = name;
+            c.application.selected_profile = name;
+            dirty = true;
+            await save();
+        }
+    }
+    else if (a === 'delete-profile') {
+        if (c.profiles.length < 2)
+            throw 'Нельзя удалить последний профиль';
+        if (await modal('Удалить профиль?', `<p>${esc(p().name)}. Установленные программы не затрагиваются.</p>`)) {
+            c.profiles = c.profiles.filter((x) => x !== p());
+            c.application.selected_profile = c.profiles[0].name;
+            dirty = true;
+            await save();
+        }
+    }
+    else if (a === 'choose-profile') {
+        c.application.selected_profile = el.dataset.name;
+        dirty = true;
+        await save();
+    }
+    else if (a === 'export-profile') {
+        await before();
+        const path = await api('browse', { kind: 'save' });
+        if (path)
+            toast(await api('export_profile', { profile: p().name, path }));
+    }
+    else if (a === 'import-profile') {
+        await before();
+        const path = await api('browse', { kind: 'open' });
+        if (path) {
+            const incoming = await api('import_profile', { path });
+            if (await modal('Импорт профиля', `<p>${esc(incoming.profiles[0].name)}</p><p>Будут добавлены определения действий. Конфликтующие определения отклоняются.</p>`)) {
+                for (const group of ['programs', 'paths', 'windows_tweaks', 'autostart', 'repositories']) {
+                    for (const item of incoming[group]) {
+                        const same = c[group].find((x) => x.key === item.key);
+                        if (same && JSON.stringify(same) !== JSON.stringify(item))
+                            throw `Конфликт ${group}: ${item.key}. Переименуйте key в импортируемом файле.`;
+                    }
+                }
+                for (const group of ['programs', 'paths', 'windows_tweaks', 'autostart', 'repositories'])
+                    for (const item of incoming[group])
+                        if (!c[group].some((x) => x.key === item.key))
+                            c[group].push(item);
+                c.appx_removal = [...new Set([...c.appx_removal, ...incoming.appx_removal])];
+                c.profiles.push(incoming.profiles[0]);
+                c.application.selected_profile = incoming.profiles[0].name;
+                dirty = true;
+                await save();
+            }
+        }
+    }
+    else if (a === 'add-program') {
+        const name = await ask('Название программы');
+        if (name) {
+            c.programs.push({ key: 'program-' + Date.now(), name, source: 'winget', id: '', version: '', location: '', url: '', sha256: '', detect_name: '', order: c.programs.length });
+            dirty = true;
+            render();
+        }
+    }
+    else if (a === 'add-folder') {
+        const path = await ask('Путь папки', '{data}\\Новая папка');
+        if (path) {
+            c.paths.push({ key: 'folder-' + Date.now(), path });
+            dirty = true;
+            render();
+        }
+    }
+    else if (a === 'add-repo') {
+        c.repositories.push({ key: 'repo-' + Date.now(), url: 'https://github.com/', target: '{data}\\Main\\repo', branch: '' });
+        dirty = true;
+        render();
+    }
+    else if (a === 'add-backup') {
+        const path = await api('browse', { kind: 'folder' });
+        if (path) {
+            c.backup.sources.push({ key: 'source-' + Date.now(), path });
+            dirty = true;
+            render();
+        }
+    }
+    else if (a === 'vault-browse') {
+        const path = await api('browse', { kind: 'open' });
+        if (path) {
+            c.backup.vault_path = path;
+            dirty = true;
+            render();
+        }
+    }
+    else if (a?.startsWith('vault-'))
+        await doVault(a.slice(6));
+    else if (a === 'save-toml') {
+        await api('save', { expected: hash, text: document.querySelector('#toml').value });
+        await load();
+    }
+    else if (a === 'remote') {
+        await before();
+        const url = document.querySelector('#config-url').value;
+        const diff = await api('remote_preview', { url });
+        const old = new Set(diff.before.split('\n')), next = new Set(diff.after.split('\n'));
+        const removed = diff.before.split('\n').filter((x) => !next.has(x)).length, added = diff.after.split('\n').filter((x) => !old.has(x)).length;
+        if (await modal('Сравнение конфигурации', `<p>${removed} удалённых строк, ${added} новых строк</p><div class="diff"><div><h3>Текущий</h3><pre>${diff.before.split('\n').map((s) => `<span class="${next.has(s) ? '' : 'removed'}">${esc(s)}</span>`).join('\n')}</pre></div><div><h3>Новый</h3><pre>${diff.after.split('\n').map((s) => `<span class="${old.has(s) ? '' : 'added'}">${esc(s)}</span>`).join('\n')}</pre></div></div>`, 'Применить новый конфиг')) {
+            await api('remote_apply', { token: diff.token, confirmed: true });
+            await load();
+        }
+    }
+    else if (a === 'rollback') {
+        if (await modal('Откатить настройки запуска?', '<p>Возвращаются реестр, StartupApproved и частота. Установки, удаления Appx и файлы автоматически не отменяются.</p>'))
+            toast(await api('rollback', { id: el.dataset.id, confirmed: true }));
+    }
+    else if (a === 'export-report') {
+        const path = await api('browse', { kind: 'save' });
+        if (path)
+            toast(await api('export_report', { id: el.dataset.id, path }));
+    }
+}
+catch (e) {
+    toast(e);
+} });
+document.addEventListener('change', async (ev) => { const el = ev.target; try {
+    if (el.dataset.devTest) {
+        if (el.checked)
+            devSelected.add(el.dataset.devTest);
+        else
+            devSelected.delete(el.dataset.devTest);
+        renderDev();
+        return;
+    }
+    if (el.id === 'dev-select-all') {
+        devSelected = el.checked ? new Set(devTests.map(t => t.id)) : new Set();
+        renderDev();
+        return;
+    }
+    if (el.id === 'dev-hide-user') {
+        devHideUser = el.checked;
+        return;
+    }
+    if (el.id === 'dev-level') {
+        devLevel = el.value;
+        renderDev();
+        return;
+    }
+    if (el.dataset.ui) {
+        const key = el.dataset.ui;
+        c.application[key] = el.type === 'checkbox' ? el.checked : key === 'ui_scale' ? Number(el.value) : el.value;
+        dirty = true;
+        theme();
+        if (key === 'dev_mode') {
+            if (!c.application.dev_mode && page === 'Тесты')
+                page = 'Главная';
+            render();
+        }
+        return;
+    }
+    if (el.id === 'profile') {
+        c.application.selected_profile = el.value;
+        dirty = true;
+        await save();
+        return;
+    }
+    if (el.id === 'first-plan') {
+        firstPlan = el.checked;
+        return;
+    }
+    if (el.id === 'technical') {
+        logs();
+        return;
+    }
+    if (el.id === 'drive')
+        c.application.data_drive = el.value;
+    else if (el.id === 'theme')
+        c.application.theme = el.value;
+    else if (el.id === 'retries')
+        c.execution.retries = Number(el.value);
+    else if (el.id === 'min-space')
+        c.execution.minimum_free_gib = Number(el.value);
+    else if (el.id === 'backup-firefox')
+        c.backup.firefox = el.checked;
+    else if (el.id === 'vault-path')
+        c.backup.vault_path = el.value;
+    else if (el.id === 'restore-in-plan')
+        p().restore_backup = el.checked;
+    else if (el.dataset.tweak)
+        p().windows_tweaks[el.dataset.tweak] = el.value;
+    else if (el.dataset.section)
+        c[el.dataset.section][Number(el.dataset.index)][el.dataset.field] = el.type === 'number' ? Number(el.value) : el.value;
+    else if (el.dataset.backup)
+        c.backup.sources[Number(el.dataset.backup)][el.dataset.field] = el.value;
+    else if (el.dataset.group) {
+        const group = el.dataset.group, id = el.dataset.id;
+        if (group === 'autostart' && !c.autostart.some((x) => x.key === id)) {
+            const x = inv.startup.find((x) => x.key === id);
+            c.autostart.push({ key: x.key, hive: x.hive, category: x.category, name: x.name });
+        }
+        if (group === 'appx_removal' && !c.appx_removal.includes(id))
+            c.appx_removal.push(id);
+        if (el.checked && !p()[group].includes(id))
+            p()[group].push(id);
+        if (!el.checked)
+            p()[group] = p()[group].filter((x) => x !== id);
+    }
+    else
+        return;
+    dirty = true;
+    plan = null;
+    render();
+}
+catch (e) {
+    toast(e);
+} });
+document.addEventListener('input', ev => { const el = ev.target; if (el.id === 'search') {
+    query = el.value;
+    filter();
+} if (el.id === 'log-filter')
+    logs(); });
+setInterval(async () => { if (loading || !c)
+    return; loading = true; try {
+    const r = await api('state');
+    if (JSON.stringify(r) !== JSON.stringify(run)) {
+        notifyDone(run, r);
+        run = r;
+        const area = document.querySelector('#progress');
+        if (area)
+            area.innerHTML = progress();
+        logs();
+    }
+    const current = await api('get');
+    if (current.hash !== hash) {
+        if (dirty) {
+            if (!external) {
+                external = true;
+                toast('Конфиг изменён снаружи. Перечитайте файл перед сохранением.');
+            }
+        }
+        else {
+            c = current.config;
+            hash = current.hash;
+            raw = current.text;
+            render();
+        }
+    }
+}
+catch (e) {
+    if (!external) {
+        toast(e);
+        external = true;
+    }
+}
+finally {
+    loading = false;
+} }, 2500);
+try {
+    await load();
+    inv = await api('inventory');
+    render();
+    if (mode !== 'choose')
+        await api('resize', { auto: mode === 'auto' });
+}
+catch (e) {
+    app.innerHTML = `<main><h1>Не удалось загрузить WinSetup</h1><pre>${esc(e)}</pre><p>Исправьте winsetup.toml рядом с exe и перезапустите приложение. Рабочая копия сохранена в .bak.</p></main>`;
+}
+export {};

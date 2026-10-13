@@ -1,0 +1,42 @@
+:root{font:14px/1.55 'Segoe UI',sans-serif;color-scheme:dark;--bg:#101419;--panel:#191f27;--line:#303a46;--fg:#e7edf5;--muted:#99a8ba;--accent:#80b8ef;--input:#111821}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg)}body.light{color-scheme:light;--bg:#f5f7fa;--panel:#fff;--line:#d8e0e9;--fg:#203047;--muted:#607188;--accent:#185c9d;--input:#f6f8fb}button,input,select,textarea{font:inherit}button{cursor:pointer;border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:8px;padding:9px 14px}button:hover{border-color:var(--accent)}button.primary{background:var(--accent);color:var(--bg);font-weight:650;border-color:transparent}button.danger{color:#f7a1a1}button:disabled{opacity:.45;cursor:default}button.link{border:0;background:transparent;color:var(--accent);padding-left:0}input,select,textarea{background:var(--input);color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:8px;max-width:100%}input:not([type=checkbox]),select{min-width:130px}input[type=checkbox]{accent-color:var(--accent)}input:focus,select:focus,textarea:focus{outline:2px solid var(--accent)}textarea{width:100%;min-height:170px;font-family:Consolas,monospace;font-size:12px}h1{font-size:29px;letter-spacing:-.8px;margin:0 0 8px}h2{font-size:18px;margin:0 0 12px}h3{font-size:15px}p{margin:8px 0;color:var(--muted)}small{color:var(--muted)}aside{position:fixed;width:204px;inset:0 auto 0 0;border-right:1px solid var(--line);padding:28px 16px;background:var(--panel)}aside .brand{font-size:22px;font-weight:700;margin:0 10px 30px}aside button{display:block;width:100%;text-align:left;border:0;margin:4px 0;color:var(--muted)}aside button.active{color:var(--accent);background:var(--input)}main{padding:32px;max-width:1400px;margin:auto}main.full{margin-left:204px}header{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:25px}.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.between{justify-content:space-between}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px}.card{border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:20px;margin:14px 0}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:20px}.tabs button.active{color:var(--accent);border-color:var(--accent)}.badge{display:inline-block;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:11px;color:var(--muted);white-space:nowrap}.risk{color:#edb978}.high{color:#ef9696}.good{color:#8cceb0}.warn{border-left:3px solid #dbb272;padding:10px 14px;background:var(--panel);margin:10px 0}.item{padding:15px 0;border-bottom:1px solid var(--line)}.item:last-child{border-bottom:0}.item label{display:flex;align-items:center;gap:10px}.item strong{font-weight:550}.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-top:12px}.fields label{display:flex;flex-direction:column;align-items:stretch;font-size:12px;color:var(--muted)}details{margin:8px 0}summary{cursor:pointer;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:var(--input);padding:12px;border-radius:7px;font:12px/1.55 Consolas,monospace;max-height:380px;overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}td,th{text-align:left;border-bottom:1px solid var(--line);padding:10px 7px;vertical-align:top;overflow-wrap:anywhere}.scroll{overflow:auto}dialog{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:15px;width:min(900px,92vw);max-height:88vh;padding:25px}dialog::backdrop{background:#0009}.modal-body{max-height:65vh;overflow:auto}.modal-buttons{justify-content:flex-end;margin-top:20px}.diff{display:grid;grid-template-columns:1fr 1fr;gap:12px}.diff pre{max-height:45vh}.removed{color:#efa0a0}.added{color:#91d7ac}#toast{display:none;position:fixed;bottom:20px;right:20px;background:var(--panel);border:1px solid var(--accent);padding:15px;border-radius:10px;max-width:620px;z-index:20;white-space:pre-wrap}.choose{max-width:800px;margin:10vh auto}.auto{max-width:680px}.auto .primary{padding:14px 32px}.auto header{margin-bottom:16px}progress{width:100%;height:10px;accent-color:var(--accent);margin:15px 0}.muted{color:var(--muted)}.savebar{position:sticky;top:0;background:var(--panel);border:1px solid var(--accent);border-radius:8px;padding:10px;z-index:5}.empty{padding:35px;text-align:center;color:var(--muted)}.search{min-width:220px!important}.hidden{display:none}@media(max-width:800px){aside{width:155px;padding:20px 8px}main.full{margin-left:155px;padding:20px}.diff{grid-template-columns:1fr}header{flex-wrap:wrap}}
+
+/* Параметры интерфейса WinSetup. Эффекты используют transform/opacity. */
+:root{--ui-scale:1;--ui-fast:125ms;--ui-page:175ms;--ui-panel:200ms}
+body{font-size:calc(14px * var(--ui-scale))}
+aside{display:flex;flex-direction:column;overflow-y:auto}
+.sidebar-footer{margin-top:auto;display:flex;flex-direction:column;gap:9px;padding:15px 8px 0;border-top:1px solid var(--line)}
+.sidebar-footer small{line-height:1.5;font-size:11px;overflow-wrap:anywhere}
+aside .gear-button{display:flex;align-items:center;justify-content:center;width:36px;height:36px;border:1px solid var(--line);border-radius:9px;margin:0;color:var(--fg)}
+.sidebar-footer .inline-link{display:inline;width:auto;min-width:0;padding:0;border:0;background:transparent;color:var(--accent);text-decoration:underline;font-size:inherit;text-align:left;margin:0}
+.ui-panel-backdrop{position:fixed;inset:0;background:#0009;z-index:30;animation:ui-fade var(--ui-panel) ease both}
+.ui-panel{position:fixed;z-index:31;inset:0 0 0 auto;width:min(430px,94vw);background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;box-shadow:-10px 0 30px #0004;animation:ui-slide var(--ui-panel) ease both}
+.ui-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:20px 22px;border-bottom:1px solid var(--line)}
+.ui-panel-heading h2{margin:0}
+.ui-panel-content{overflow-y:auto;padding:10px 22px 25px}
+.ui-panel-content h3{margin:22px 0 12px;border-bottom:1px solid var(--line);padding-bottom:6px}
+.ui-panel-content label:not(.ui-check){display:flex;justify-content:space-between;align-items:center;gap:12px;margin:12px 0}
+.ui-panel-content select{min-width:145px}
+.ui-panel-content .ui-check{display:flex;align-items:center;gap:8px;margin:14px 0}
+.ui-reset{margin-top:25px}
+button{transition:transform var(--ui-fast) ease,opacity var(--ui-fast) ease}
+button:not(:disabled):hover{transform:translateY(-1px)}
+button:not(:disabled):active{transform:translateY(1px);opacity:.8}
+main.full,main.auto,main.choose{animation:ui-enter var(--ui-page) ease both}
+dialog[open]{animation:ui-enter var(--ui-panel) ease both}
+.warn,.savebar{animation:ui-fade var(--ui-page) ease both}
+progress{transition:opacity var(--ui-page) ease}
+progress::-webkit-progress-value{transition:transform var(--ui-page) ease}
+body.compact .card{padding:14px;margin:9px 0}
+body.compact .item{padding:9px 0}
+body.compact button{padding:6px 10px}
+body.compact aside .gear-button{padding:6px}
+@keyframes ui-enter{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+@keyframes ui-fade{from{opacity:0}to{opacity:1}}
+@keyframes ui-slide{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:translateX(0)}}
+body.reduce-motion *,body.reduce-motion *::before,body.reduce-motion *::after{animation-duration:0ms!important;transition-duration:0ms!important}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:0ms!important;transition-duration:0ms!important}}
+.ui-progress-track{width:100%;height:10px;border-radius:999px;background:var(--line);overflow:hidden;margin:15px 0}
+.ui-progress-fill{width:100%;height:100%;background:var(--accent);transform-origin:left center;transition:transform var(--ui-page) ease}
+.ui-running{display:inline-flex;align-items:center;gap:9px;color:var(--muted);font-size:12px}
+.ui-running::before{content:"";width:11px;height:11px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:ui-spin 1.6s linear infinite}
+@keyframes ui-spin{to{transform:rotate(360deg)}}

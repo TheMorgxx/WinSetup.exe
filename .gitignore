@@ -1,0 +1,20 @@
+# Dependencies and build caches
+/node_modules/
+/src-tauri/target/
+/src-tauri/gen/
+
+# Local builds, test reports, backups and personal settings
+/release/
+/snapshots/
+/logs/
+/winsetup.toml
+*.bak
+*.bak-*
+*.zip
+/devmode*-report.md
+/DEVMODE*_PROGRESS.md
+/report.md
+/gitset.bat
+.env
+.env.*
+!.env.example

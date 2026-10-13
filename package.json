@@ -1,0 +1,1 @@
+{"name":"winsetup-ui","version":"1.0.0","private":true,"scripts":{"build":"tsc && node build-ui.cjs"},"devDependencies":{"typescript":"^5.9.0"}}
