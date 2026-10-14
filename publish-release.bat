@@ -72,6 +72,7 @@ try {
         $jsonText=$versionPattern.Replace($jsonText,{param($m)$m.Groups[1].Value+$version+$m.Groups[2].Value})
         [IO.File]::WriteAllText($full,$jsonText,[Text.UTF8Encoding]::new($false))
     }
+    & npm.cmd run test:ui;if($LASTEXITCODE -ne 0){throw 'Тесты интерфейса не прошли'}
     & npm.cmd run build;if($LASTEXITCODE -ne 0){throw 'Сборка интерфейса не прошла'}
     & cargo check --manifest-path src-tauri/Cargo.toml;if($LASTEXITCODE -ne 0){throw 'cargo check не прошёл'}
     & cargo test --lib --manifest-path src-tauri/Cargo.toml;if($LASTEXITCODE -ne 0){throw 'Unit-тесты не прошли'}
@@ -94,7 +95,7 @@ try {
     foreach($entry in $remoteTags){$parts=$entry -split '\s+';if(-not $tagTarget -or $parts[1].EndsWith('^{}')){$tagTarget=$parts[0]}}
     if($tagTarget -and $tagTarget -ne $commit){throw 'Тег этой версии уже относится к другому коммиту. Увеличьте версию.'}
     if($existing -and $existing.target_commitish -ne $commit){throw 'Черновик этого тега относится к другому коммиту. Используйте новую версию.'}
-    $body="Готовая сборка WinSetup $version для Windows x64.`n`nСкачайте WinSetup.exe из Assets и поместите в отдельную папку. Отсутствующий winsetup.toml создаётся автоматически. Подготовка среды проверяет winget и предлагает установку официальных пакетов Microsoft только после подтверждения.`n`nИсходники: $commit`nSHA-256 WinSetup.exe: $sha`n`nСборка и unit-тесты пройдены. Приложение, скачивание пакетов и установка winget при публикации не запускались. Подробности: bootstrap-report.md в исходниках."
+    $body="Готовая сборка WinSetup $version для Windows x64.`n`nСкачайте WinSetup.exe из Assets и поместите в отдельную папку. Отсутствующий winsetup.toml создаётся автоматически. Подготовка среды проверяет winget и предлагает установку официальных пакетов Microsoft только после подтверждения.`n`nИсходники: $commit`nSHA-256 WinSetup.exe: $sha`n`nСборка и unit-тесты пройдены. Приложение, скачивание пакетов и установка winget при публикации не запускались. Подробности: bootstrap-report.md и reliability-report.md в исходниках."
     if($existing){$release=$existing}else{$release=Github 'Post' ($base+'/releases') @{tag_name=$tag;target_commitish=$commit;name=('WinSetup '+$version);body=$body;draft=$true;prerelease=$false}}
     Write-Host ('Черновик релиза: '+$release.id)
     $asset=@($release.assets|Where-Object {$_.name -eq 'WinSetup.exe'})

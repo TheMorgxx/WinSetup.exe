@@ -9,7 +9,7 @@ use std::{
     process::{Command, Stdio},
     time::Duration,
 };
-fn raw_command(exe: &str, args: &[String]) -> Result<(bool, String, String)> {
+fn raw_command(exe: &str, args: &[String], timeout: Option<Duration>) -> Result<(bool, Option<i32>, String, String)> {
     let mut child = Command::new(exe)
         .args(args)
         .creation_flags(0x08000000)
@@ -28,7 +28,8 @@ fn raw_command(exe: &str, args: &[String]) -> Result<(bool, String, String)> {
                     break;
                 }
                 if out.len() < 4 * 1024 * 1024 {
-                    out.extend_from_slice(&b[..n]);
+                    let keep = n.min(4 * 1024 * 1024 - out.len());
+                    out.extend_from_slice(&b[..keep]);
                 }
             }
             String::from_utf8_lossy(&out).to_string()
@@ -36,48 +37,65 @@ fn raw_command(exe: &str, args: &[String]) -> Result<(bool, String, String)> {
     };
     let stdout = drain(Box::new(child.stdout.take().unwrap()));
     let stderr = drain(Box::new(child.stderr.take().unwrap()));
+    let began = std::time::Instant::now();
     let status = loop {
-        if let Some(s) = child.try_wait()? {
-            break s;
+        match child.try_wait() {
+            Ok(Some(s)) => break Ok(s),
+            Ok(None) if timeout.map(|limit| began.elapsed() >= limit).unwrap_or(false) => {
+                let _ = child.kill(); let _ = child.wait();
+                break Err(anyhow::anyhow!("Истёк тайм-аут команды чтения: {exe}"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => {
+                let _ = child.kill(); let _ = child.wait();
+                break Err(e.into());
+            }
         }
-        std::thread::sleep(Duration::from_millis(250));
     };
-    Ok((
-        status.success(),
-        stdout.join().unwrap_or_default(),
-        stderr.join().unwrap_or_default(),
-    ))
+    let out = stdout.join().map_err(|_| anyhow::anyhow!("Ошибка чтения stdout"))?;
+    let err = stderr.join().map_err(|_| anyhow::anyhow!("Ошибка чтения stderr"))?;
+    let status = status?;
+    Ok((status.success(), status.code(), out, err))
+}
+#[derive(Debug)]
+pub struct CommandResult {
+    pub success: bool,
+    pub code: Option<i32>,
+    pub output: String,
+}
+pub fn command_result(exe: &str, args: &[String]) -> Result<CommandResult> {
+    // Установщики не завершаются принудительно: отмена профиля действует между задачами.
+    let (success, code, out, err) = raw_command(exe, args, None)?;
+    Ok(CommandResult {success, code, output: format!("{out}\n{err}")})
 }
 pub fn command(exe: &str, args: &[String]) -> Result<(bool, String)> {
-    let (ok, out, err) = raw_command(exe, args)?;
-    Ok((ok, format!("{}\n{}", out, err)))
+    let result = command_result(exe, args)?;
+    Ok((result.success, result.output))
 }
-pub fn ps(script: &str, input: &Value) -> Result<Value> {
+pub fn compact_output(output: &str) -> String {
+    let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
+    let clean = ansi.replace_all(output, "");
+    let chars: Vec<char> = clean.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')).collect();
+    if chars.len() <= 6000 {return chars.into_iter().collect::<String>().trim().into();}
+    format!("{}\n… Длинный вывод сокращён; начало и конец сохранены …\n{}",
+        chars[..1400].iter().collect::<String>().trim(),
+        chars[chars.len()-3600..].iter().collect::<String>().trim())
+}
+fn ps_with_timeout(script: &str, input: &Value, timeout: Option<Duration>) -> Result<Value> {
     let data = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(input)?);
-    let script=format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$i=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'))|ConvertFrom-Json);{}",data,script);
-    let bytes = script
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect::<Vec<_>>();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    let (ok, out, err) = raw_command(
-        &format!(
-            "{}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-            std::env::var("WINDIR")?
-        ),
-        &vec![
-            "-NoProfile".into(),
-            "-NonInteractive".into(),
-            "-EncodedCommand".into(),
-            encoded,
-        ],
-    )?;
-    ensure!(ok, "{}\n{}", out, err);
-    if out.trim().is_empty() {
-        return Ok(Value::Null);
-    }
-    serde_json::from_str(out.trim()).with_context(|| format!("Ответ PowerShell: {}", out))
+    let script=format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);try {{$i=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{data}'))|ConvertFrom-Json);{script}}} catch {{[Console]::Error.WriteLine($_.Exception.Message);exit 1}}");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(
+        script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+    let (ok, _, out, err) = raw_command(
+        &format!("{}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",std::env::var("WINDIR")?),
+        &["-NoProfile".into(),"-NonInteractive".into(),"-EncodedCommand".into(),encoded],timeout)?;
+    ensure!(ok, "{}", compact_output(&format!("{out}\n{err}")));
+    let out = out.trim_start_matches('\u{feff}').trim();
+    if out.is_empty() {return Ok(Value::Null);}
+    serde_json::from_str(out).with_context(|| format!("Некорректный ответ PowerShell: {}", compact_output(out)))
 }
+pub fn ps(script: &str, input: &Value) -> Result<Value> {ps_with_timeout(script,input,None)}
+fn ps_readonly(script: &str, input: &Value) -> Result<Value> {ps_with_timeout(script,input,Some(Duration::from_secs(10)))}
 pub fn array(v: Value) -> Vec<Value> {
     match v {
         Value::Array(a) => a,
@@ -110,28 +128,95 @@ pub fn inventory() -> Result<Value> {
     )?;
     Ok(v)
 }
+fn registry_matches(p: &crate::model::Program, app: &Value) -> bool {
+    let name=app["name"].as_str().unwrap_or("").trim();
+    let publisher=app["publisher"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+    let version=app["version"].as_str().unwrap_or("").trim();
+    if !p.version.is_empty() && version!=p.version {return false;}
+    if p.source=="direct" {return !p.detect_name.is_empty() && name.eq_ignore_ascii_case(&p.detect_name);}
+    if p.source!="winget" {return false;}
+    let (names,publishers):(&[&str],&[&str])=match p.id.as_str() {
+        "Discord.Discord" => (&["Discord"], &["discord inc.","discord inc"]),
+        "Anthropic.Claude" => (&["Claude"], &["anthropic","anthropic, pbc","anthropic pbc"]),
+        "Asus.ArmouryCrate" => (&["ARMOURY CRATE","Armoury Crate"], &["asustek computer inc.","asustek computer inc"]),
+        _ => return false,
+    };
+    names.iter().any(|n|name.eq_ignore_ascii_case(n)) && publishers.contains(&publisher.as_str())
+}
+fn winget_list_matches(output: &str, p: &crate::model::Program) -> bool {
+    output.lines().any(|line| {
+        let fields=line.split_whitespace().collect::<Vec<_>>();
+        fields.iter().position(|v|v.eq_ignore_ascii_case(&p.id)).map(|index|
+            index>0 && fields.get(index+1).map(|version| p.version.is_empty() || *version==p.version).unwrap_or(false)
+        ).unwrap_or(false)
+    })
+}
+fn latest_discord_app(root: &std::path::Path) -> Option<PathBuf> {
+    std::fs::read_dir(root).ok()?.filter_map(|e|e.ok()).filter_map(|e|{
+        if !e.file_type().ok()?.is_dir() {return None;}
+        let name=e.file_name().to_str()?.to_owned();
+        let version=name.strip_prefix("app-")?.split('.').map(str::parse::<u32>).collect::<std::result::Result<Vec<_>,_>>().ok()?;
+        if version.len()<3 || !e.path().join("Discord.exe").is_file() {return None;}
+        Some((version,e.path()))
+    }).max_by(|a,b|a.0.cmp(&b.0)).map(|x|x.1)
+}
+fn vencord_at(discord: &std::path::Path, data: &std::path::Path) -> Result<bool> {
+    // Read-only verification of the stable Discord patch written by Vencord/Installer.
+    // A downloaded patcher alone is insufficient; the active app.asar must require it.
+    let Some(app)=latest_discord_app(discord) else {return Ok(false)};
+    let patcher=data.join("dist/patcher.js");
+    if !patcher.is_file() || std::fs::metadata(&patcher)?.len()==0 {return Ok(false);}
+    let resources=app.join("resources");
+    if !resources.join("_app.asar").is_file() {return Ok(false);}
+    let path=resources.join("app.asar");
+    if !path.is_file() || std::fs::metadata(&path)?.len()>1024*1024 {return Ok(false);}
+    let bytes=std::fs::read(path)?;
+    let text=String::from_utf8_lossy(&bytes);
+    let require=regex::Regex::new(r#"require\(("(?:[^"\\]|\\.)*")\)"#)?;
+    let expected=patcher.canonicalize()?;
+    for capture in require.captures_iter(&text) {
+        if let Ok(value)=serde_json::from_str::<String>(&capture[1]) {
+            if PathBuf::from(value).canonicalize().ok().as_ref()==Some(&expected) {return Ok(true);}
+        }
+    }
+    Ok(false)
+}
 pub fn installed(p: &crate::model::Program) -> Result<bool> {
-    if p.source == "git" {
-        return Ok(false);
+    if p.source=="git" {return Ok(false);}
+    if p.source=="winget" && p.id=="Vendicated.Vencord" {
+        ensure!(p.version.is_empty(),"Версия установщика Vencord не подтверждает версию модификации Discord; автоматическая проверка закреплённой версии недоступна");
+        let local=std::env::var_os("LOCALAPPDATA").context("Не найден LOCALAPPDATA для проверки Discord")?;
+        let data=if let Some(path)=std::env::var_os("VENCORD_USER_DATA_DIR").filter(|s|!s.is_empty()) {PathBuf::from(path)}
+            else if let Some(path)=std::env::var_os("DISCORD_USER_DATA_DIR").filter(|s|!s.is_empty()) {PathBuf::from(path).join("../VencordData")}
+            else {PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").filter(|s|!s.is_empty()).or_else(||std::env::var_os("APPDATA")).context("Не найден каталог настроек для проверки Vencord")?).join("Vencord")};
+        return vencord_at(&PathBuf::from(local).join("Discord"),&data);
     }
-    if p.source == "direct" {
-        return Ok(ps(r#"$found=@(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue|Where-Object {$_.DisplayName -eq $i.name});[bool]($found.Count -gt 0)|ConvertTo-Json"#,&json!({"name":p.detect_name}))?.as_bool().unwrap_or(false));
+    let mut registry_error=None;
+    if p.source=="direct" || (p.source=="winget" && ["Discord.Discord","Anthropic.Claude","Asus.ArmouryCrate"].contains(&p.id.as_str())) {
+        let apps=ps_readonly(r#"
+$roots=@('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+$apps=@(foreach($root in $roots){if(Test-Path -LiteralPath $root){Get-ItemProperty ($root+'\*') -ErrorAction Stop|ForEach-Object {@{name=[string]$_.DisplayName;publisher=[string]$_.Publisher;version=[string]$_.DisplayVersion}}}})
+ConvertTo-Json -InputObject $apps -Depth 3
+"#,&json!({}));
+        match apps {
+            Ok(apps) => {if array(apps).iter().any(|a|registry_matches(p,a)){return Ok(true);}},
+            Err(e) => registry_error=Some(e),
+        }
+        if p.source=="direct" {return match registry_error {Some(e)=>Err(e),None=>Ok(false)};}
     }
-    let args = vec![
-        "list".into(),
-        "--id".into(),
-        p.id.clone(),
-        "--exact".into(),
-        "--source".into(),
-        p.source.clone(),
-        "--disable-interactivity".into(),
-    ];
-    let (ok, out) = command("winget.exe", &args)?;
-    Ok(ok
-        && out.lines().any(|line| {
-            line.contains(&p.id)
-                && (p.version.is_empty() || line.split_whitespace().any(|v| v == p.version))
-        }))
+    let args=vec!["list".into(),"--id".into(),p.id.clone(),"--exact".into(),"--source".into(),p.source.clone(),
+        "--accept-source-agreements".into(),"--disable-interactivity".into()];
+    let (ok,code,out,err)=raw_command("winget.exe",&args,Some(Duration::from_secs(20)))?;
+    if ok {let mut any_version=p.clone();any_version.version.clear();if winget_list_matches(&out,&any_version){return Ok(winget_list_matches(&out,p));}}
+    // APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND: absence, not a failed system probe.
+    if code.map(|c|c as u32)==Some(0x8A150014) {
+        return match registry_error {Some(e)=>Err(e),None=>Ok(false)};
+    }
+    ensure!(ok,"Не удалось проверить {} через winget list (код {:?}): {}",p.name,code,compact_output(&format!("{out}\n{err}")));
+    if let Some(e)=registry_error {return Err(e);}
+    ensure!(winget_list_matches(&out,p),"winget list завершился, но однозначное совпадение {}{} не подтверждено. {}",p.id,
+        if p.version.is_empty(){String::new()}else{format!(" версии {}",p.version)},compact_output(&out));
+    Ok(true)
 }
 pub fn remove_app(name: &str) -> Result<String> {
     ensure!(crate::model::removable(name), "Защищённый пакет");
@@ -200,7 +285,7 @@ fn fresh_sequence(
 pub fn restore_point(started: chrono::DateTime<chrono::Local>) -> Result<String> {
     let started = chrono::Timelike::with_nanosecond(&started, 0).unwrap_or(started);
     let v = ps(
-        r#"$before=0;try{$b=@(Get-ComputerRestorePoint|Sort-Object SequenceNumber|Select-Object -Last 1);if($b.Count -gt 0 -and $b[0]){$before=[int]$b[0].SequenceNumber}}catch{};$cw=$null;Checkpoint-Computer -Description $i.desc -RestorePointType MODIFY_SETTINGS -WarningVariable cw -WarningAction SilentlyContinue;$w=@();foreach($m in @($cw)){if($m){$w+=[string]$m}};$points=@();$err='';try{$points=@(Get-ComputerRestorePoint|Where-Object{$_.Description -eq $i.desc}|ForEach-Object{@{seq=[int]$_.SequenceNumber;created=[string]$_.CreationTime}})}catch{$err=[string]$_.Exception.Message};@{before=$before;points=@($points);warnings=@($w);error=$err}|ConvertTo-Json -Depth 4"#,
+        r#"$before=0;try{$b=@(Get-ComputerRestorePoint|Sort-Object SequenceNumber|Select-Object -Last 1);if($b.Count -gt 0 -and $b[0]){$before=[int]$b[0].SequenceNumber}}catch{};$cw=$null;try{Checkpoint-Computer -Description $i.desc -RestorePointType MODIFY_SETTINGS -WarningVariable cw -WarningAction SilentlyContinue}catch{if($_.FullyQualifiedErrorId -like 'ServiceDisabled*'){throw 'Не удалось создать точку восстановления: необходимая служба Windows отключена (ServiceDisabled). Проверьте Защиту системы. WinSetup не включает службы автоматически; продолжение без точки требует подтверждения.'};throw};$w=@();foreach($m in @($cw)){if($m){$w+=[string]$m}};$points=@();$err='';try{$points=@(Get-ComputerRestorePoint|Where-Object{$_.Description -eq $i.desc}|ForEach-Object{@{seq=[int]$_.SequenceNumber;created=[string]$_.CreationTime}})}catch{$err=[string]$_.Exception.Message};@{before=$before;points=@($points);warnings=@($w);error=$err}|ConvertTo-Json -Depth 4"#,
         &json!({"desc":RESTORE_DESCRIPTION}),
     )?;
     let warnings = v["warnings"]
@@ -646,5 +731,77 @@ mod restore_point_tests {
         assert_eq!(fresh_sequence(single, 8, start, now), Some(9));
         let stale = json!([{"seq": 9, "created": wmi(now - Duration::hours(30), None)}]);
         assert_eq!(fresh_sequence(stale, 8, start, now), None);
+    }
+}
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+    fn program(id:&str)->crate::model::Program {crate::model::defaults().programs.into_iter().find(|p|p.id==id).unwrap()}
+    #[test]
+    fn registry_requires_exact_application_publisher_and_version() {
+        let mut p=program("Discord.Discord");
+        let app=json!({"name":"Discord","publisher":"Discord Inc.","version":"1.0.9262"});
+        assert!(registry_matches(&p,&app));
+        assert!(!registry_matches(&p,&json!({"name":"Discord Updater","publisher":"Discord Inc.","version":"1.0.9262"})));
+        assert!(!registry_matches(&p,&json!({"name":"Discord","publisher":"Unrelated company","version":"1.0.9262"})));
+        p.version="1.0.9262".into();assert!(registry_matches(&p,&app));
+        p.version="2.0".into();assert!(!registry_matches(&p,&app));
+        let armoury=program("Asus.ArmouryCrate");
+        assert!(!registry_matches(&armoury,&json!({"name":"ARMOURY CRATE Lite Service","publisher":"ASUSTeK COMPUTER INC."})));
+        assert!(registry_matches(&armoury,&json!({"name":"ARMOURY CRATE","publisher":"ASUSTeK COMPUTER INC."})));
+    }
+    #[test]
+    fn winget_identity_and_version_are_not_substring_matches() {
+        let mut p=program("Discord.Discord");
+        assert!(winget_list_matches("Discord  Discord.Discord  1.0.9262  winget",&p));
+        assert!(!winget_list_matches("Discord Canary  Discord.Discord.Canary  1.0.9262 winget",&p));
+        assert!(!winget_list_matches("Name Id Version Source\n-------------------",&p));
+        p.version="1.0.9262".into();
+        assert!(winget_list_matches("Discord  Discord.Discord  1.0.9262 winget",&p));
+        assert!(!winget_list_matches("Discord  Discord.Discord  1.0.92620 winget",&p));
+    }
+    #[test]
+    fn compact_log_preserves_unicode_and_final_installer_error() {
+        let original=format!("Found NVIDIA App\n{}\nInstaller failed with exit code: 3858759680","Лицензионный текст ".repeat(2000));
+        let result=compact_output(&original);
+        assert!(result.starts_with("Found NVIDIA App"));
+        assert!(result.ends_with("Installer failed with exit code: 3858759680"));
+        assert!(result.chars().count()<6000);
+        assert_eq!(compact_output("\u{1b}[31mОшибка\u{1b}[0m"),"Ошибка");
+    }
+    #[test]
+    fn powershell_errors_are_readable_and_success_json_is_unchanged() {
+        let err=ps_readonly("throw 'Проверка: служба отключена'",&Value::Null).unwrap_err().to_string();
+        assert!(err.contains("Проверка: служба отключена"),"{err}");
+        assert!(!err.contains("CLIXML") && !err.contains("_x000D_"),"{err}");
+        assert_eq!(ps_readonly("@{ok=$true;message='Готово'}|ConvertTo-Json",&Value::Null).unwrap(),json!({"ok":true,"message":"Готово"}));
+    }
+    #[test]
+    fn readonly_powershell_timeout_stops_only_its_probe() {
+        let start=std::time::Instant::now();
+        let error=ps_with_timeout("Start-Sleep -Seconds 10",&Value::Null,Some(Duration::from_millis(200))).unwrap_err().to_string();
+        assert!(error.contains("тайм-аут"),"{error}");
+        assert!(start.elapsed()<Duration::from_secs(6));
+    }
+    #[test]
+    fn vencord_requires_patch_in_latest_discord_and_existing_runtime() {
+        let dir=tempfile::tempdir().unwrap();
+        let discord=dir.path().join("Discord");let data=dir.path().join("Vencord");
+        let old=discord.join("app-1.0.9");let latest=discord.join("app-1.0.10");
+        for app in [&old,&latest] {
+            std::fs::create_dir_all(app.join("resources")).unwrap();
+            std::fs::write(app.join("Discord.exe"),"fixture").unwrap();
+            std::fs::write(app.join("resources/_app.asar"),"original fixture").unwrap();
+        }
+        std::fs::create_dir_all(data.join("dist")).unwrap();
+        let patcher=data.join("dist/patcher.js");std::fs::write(&patcher,"fixture only; never executed").unwrap();
+        let require=format!("require({})",serde_json::to_string(&patcher.to_string_lossy()).unwrap());
+        std::fs::write(old.join("resources/app.asar"),&require).unwrap();
+        std::fs::write(latest.join("resources/app.asar"),"unpatched").unwrap();
+        assert!(!vencord_at(&discord,&data).unwrap(),"An old patch must not hide a new unpatched installation");
+        std::fs::write(latest.join("resources/app.asar"),&require).unwrap();
+        assert!(vencord_at(&discord,&data).unwrap());
+        std::fs::remove_file(&patcher).unwrap();
+        assert!(!vencord_at(&discord,&data).unwrap());
     }
 }

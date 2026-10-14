@@ -38,7 +38,7 @@ try {
     & git.exe merge-base --is-ancestor origin/main HEAD
     if($LASTEXITCODE -ne 0){throw 'Удалённая main содержит новые коммиты. Сначала согласуйте изменения; force push не используется.'}
     foreach($commit in @(Invoke-GitChecked @('rev-list','origin/main..HEAD'))){Check-Paths @(Invoke-GitChecked @('ls-tree','-r','--name-only',$commit))}
-    $allowed=@('.gitignore','README.md','build-ui.cjs','build.bat','publish-files.bat','publish-release.bat','package.json','package-lock.json','tsconfig.json','winsetup.example.toml','ui','dist','src-tauri/src','src-tauri/icons','src-tauri/Cargo.toml','src-tauri/Cargo.lock','src-tauri/app.manifest','src-tauri/build.rs','src-tauri/tauri.conf.json','BOOTSTRAP_PROGRESS.md','bootstrap-report.md')
+    $allowed=@('.gitignore','README.md','build-ui.cjs','build.bat','publish-files.bat','publish-release.bat','package.json','package-lock.json','tsconfig.json','winsetup.example.toml','ui','dist','src-tauri/src','src-tauri/icons','src-tauri/Cargo.toml','src-tauri/Cargo.lock','src-tauri/app.manifest','src-tauri/build.rs','src-tauri/tauri.conf.json','BOOTSTRAP_PROGRESS.md','bootstrap-report.md','reliability-report.md')
     $paths=@($allowed | Where-Object {(Test-Path -LiteralPath $_) -or @(& git.exe ls-files -- $_).Count -gt 0})
     # Не включать случайно уже подготовленные пользователем файлы вне списка.
     foreach($staged in @(Invoke-GitChecked @('diff','--cached','--name-only'))){

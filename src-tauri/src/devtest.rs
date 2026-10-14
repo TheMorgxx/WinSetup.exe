@@ -580,7 +580,7 @@ mod tests {
         temp.cleanup().unwrap();
     }
     fn plan(actions: Vec<engine::Action>) -> engine::Plan {
-        engine::Plan {profile:"тест".into(),fingerprint:"".into(),warnings:vec![],readiness:json!({"apps":[]}),displays:vec![],tasks:actions.into_iter().enumerate().map(|(id,action)|engine::Task {id,action,name:"".into(),risk:"".into(),reversible:"".into(),status:"pending".into(),detail:"".into()}).collect()}
+        engine::Plan {profile:"тест".into(),fingerprint:"".into(),warnings:vec![],readiness:json!({"apps":[]}),displays:vec![],tasks:actions.into_iter().enumerate().map(|(id,action)|engine::Task {id,action,verification_only:false,name:"".into(),risk:"".into(),reversible:"".into(),status:"pending".into(),detail:"".into()}).collect()}
     }
     #[test]
     fn rejects_vencord_before_discord_and_protected_packages() {
