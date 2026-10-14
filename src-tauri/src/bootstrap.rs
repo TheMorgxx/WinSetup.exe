@@ -94,7 +94,9 @@ fn capture(program:&Path,args:&[String],timeout:Duration)->Result<String> {
 }
 fn ps(script:&str,input:Value,timeout:Duration)->Result<Value> {
     let data=base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&input)?);
-    let script=format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new();$i=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{data}'))|ConvertFrom-Json);{script}");
+    // -EncodedCommand serializes uncaught PowerShell errors as CLIXML.
+    // Write the caught exception directly to stderr so capture() receives readable UTF-8.
+    let script=format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);try {{$i=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{data}'))|ConvertFrom-Json);{script}}} catch {{[Console]::Error.WriteLine($_.Exception.Message);exit 1}}");
     let encoded=base64::engine::general_purpose::STANDARD.encode(script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
     let exe=PathBuf::from(std::env::var_os("WINDIR").context("Не найден каталог Windows")?).join("System32/WindowsPowerShell/v1.0/powershell.exe");
     let output=capture(&exe,&["-NoProfile".into(),"-NonInteractive".into(),"-EncodedCommand".into(),encoded],timeout)?;
@@ -193,13 +195,15 @@ fn download(source:&str,target:&Path,limit:u64,expected:&str)->Result<()> {
     }
 }
 const EXTRACT_DEPENDENCIES:&str=r#"
-Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -AssemblyName System.IO.Compression.FileSystem, System.IO.Compression
 $archive=[IO.Compression.ZipFile]::OpenRead($i.archive)
 $paths=@();$desktop=$false;$total=0L
 try {
  if($archive.Entries.Count -gt 256){throw 'Слишком много файлов зависимостей'}
  foreach($entry in $archive.Entries){
-  if($entry.FullName -cmatch '^(?:x64/)?Microsoft\.VCLibs\.140\.00(?:\.UWPDesktop)?_[0-9.]+_x64__8wekyb3d8bbwe\.(?:appx|msix)$'){
+  # Release ZIP filenames omit the package-family publisher suffix; accept both forms.
+  $entryName=$entry.FullName.Replace('\','/')
+  if($entryName -cmatch '^(?:x64/)?Microsoft\.VCLibs\.140\.00(?:\.UWPDesktop)?_[0-9]+(?:\.[0-9]+){3}_x64(?:__8wekyb3d8bbwe)?\.(?:appx|msix)$'){
    if($entry.Length -le 0 -or $entry.Length -gt 67108864 -or $paths.Count -ge 8){throw 'Размер зависимости недопустим'}
    $total+=$entry.Length;if($total -gt 134217728){throw 'Слишком большой объём зависимостей'}
    $target=Join-Path $i.folder ('dependency-'+$paths.Count+'.appx')
@@ -209,7 +213,7 @@ try {
    if($entry.FullName.Contains('Microsoft.VCLibs.140.00.UWPDesktop_')){$desktop=$true};$paths+=$target
   }
  }
- if(-not $desktop){throw 'Не найдена x64 Microsoft.VCLibs.140.00.UWPDesktop'}
+ if(-not $desktop){throw 'В архиве зависимостей не найдена x64 Microsoft.VCLibs.140.00.UWPDesktop; установка не начата'}
  ConvertTo-Json -InputObject @($paths)
 } finally {$archive.Dispose()}
 "#;
@@ -302,5 +306,64 @@ mod download_tests {
     fn download_domains_and_repository_boundaries_are_enforced() {
         for value in [BUNDLE,DEPENDENCIES,XAML,"https://aka.ms/getwinget","https://release-assets.githubusercontent.com/github-production-release-asset/test?token=test","https://download.microsoft.com/example.appx"] {assert!(allowed_url(&url::Url::parse(value).unwrap()),"{value}");}
         for value in ["http://aka.ms/getwinget","https://github.com/other/winget-cli/releases/a","https://github.com/microsoft-evil/winget-cli/releases/a","https://github.com.evil.com/microsoft/winget-cli/releases/a","https://example.com/a","https://user:password@github.com/microsoft/winget-cli/releases/a","https://github.com:444/microsoft/winget-cli/releases/a","https://aka.ms/other","https://release-assets.githubusercontent.com.evil.org/a"] {assert!(!allowed_url(&url::Url::parse(value).unwrap()),"{value}");}
+    }
+
+    // Only synthetic archive entries are created/extracted; no network or Appx installation.
+    fn synthetic_archive(root:&Path,names:&[&str])->PathBuf {
+        let archive=root.join("dependencies.zip");
+        ps(r#"
+Add-Type -AssemblyName System.IO.Compression.FileSystem, System.IO.Compression
+$zip=[IO.Compression.ZipFile]::Open($i.archive,[IO.Compression.ZipArchiveMode]::Create)
+try {
+ foreach($name in $i.names) {
+  $entry=$zip.CreateEntry($name)
+  $writer=[IO.StreamWriter]::new($entry.Open())
+  try {$writer.Write('local test fixture')} finally {$writer.Dispose()}
+ }
+} finally {$zip.Dispose()}
+"#,json!({"archive":archive,"names":names}),Duration::from_secs(15)).unwrap();
+        archive
+    }
+    #[test]
+    fn release_archive_names_extract_only_x64_vclibs() {
+        // Standard filename documented by microsoft/winget-pkgs, plus the former full name.
+        for desktop in [
+            "x64/Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64.appx",
+            r"x64\Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64__8wekyb3d8bbwe.appx",
+        ] {
+            let temp=tempfile::tempdir().unwrap();
+            let archive=synthetic_archive(temp.path(),&[
+                desktop,
+                "x64/Microsoft.VCLibs.140.00_14.0.33519.0_x64.appx",
+                "x86/Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x86.appx",
+                "arm64/Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_arm64.appx",
+                "../Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64.appx",
+                "x64/../Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64.appx",
+                "x64/Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64__wrongpublisher.appx",
+                "x64/unrelated.appx",
+            ]);
+            let result=ps(EXTRACT_DEPENDENCIES,json!({"archive":archive,"folder":temp.path()}),Duration::from_secs(15)).unwrap();
+            let paths=result.as_array().unwrap();
+            assert_eq!(paths.len(),2);
+            for (index,path) in paths.iter().enumerate() {
+                let expected=temp.path().join(format!("dependency-{index}.appx"));
+                assert_eq!(Path::new(path.as_str().unwrap()),expected);
+                assert_eq!(fs::read_to_string(expected).unwrap(),"local test fixture");
+            }
+            assert_eq!(fs::read_dir(temp.path()).unwrap().count(),3);
+        }
+    }
+    #[test]
+    fn missing_desktop_dependency_returns_readable_error_without_clixml() {
+        let temp=tempfile::tempdir().unwrap();
+        let archive=synthetic_archive(temp.path(),&[
+            "x86/Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x86.appx",
+            "../Microsoft.VCLibs.140.00.UWPDesktop_14.0.33728.0_x64.appx",
+        ]);
+        let error=ps(EXTRACT_DEPENDENCIES,json!({"archive":archive,"folder":temp.path()}),Duration::from_secs(15)).unwrap_err().to_string();
+        assert!(error.contains("В архиве зависимостей не найдена x64 Microsoft.VCLibs.140.00.UWPDesktop"),"{error}");
+        assert!(error.contains("установка не начата"),"{error}");
+        for markup in ["CLIXML","<Objs","_x000D_","_x000A_"] {assert!(!error.contains(markup),"{error}");}
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(),1);
     }
 }
