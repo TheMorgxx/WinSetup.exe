@@ -1,4 +1,4 @@
-//! Безопасная диагностика. Никогда не вызывает engine::start/execute/rollback.
+//! Безопасные тесты и отдельные явно подтверждаемые реальные тесты и приёмка.
 use crate::{engine, model, storage, system, vault};
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -418,7 +418,7 @@ fn check(root: &Path, id: &str) -> Result<Outcome> {
         "startup" => Ok(outcome(Status::PASS,"Автозапуск прочитан",pretty(&system::startup()?))),
         "tweaks" => {
             let mut values=Vec::new();
-            for key in model::TWEAKS { if *key=="max_refresh" {values.push(json!({"ключ":key,"дисплеи":system::displays()}));} else {for (path,name,_) in system::tweak_values(key,"enabled")? {values.push(json!({"ключ":key,"значение":system::snapshot("HKCU",&path,&name)?}));}} }
+            for key in model::TWEAKS { if *key=="max_refresh" {values.push(json!({"ключ":key,"дисплеи":system::displays().iter().map(|d|json!({"режим":d,"решение":system::refresh_decision(d).map(|v|v.message()).unwrap_or_else(|e|e.to_string())})).collect::<Vec<_>>()}));} else {for (path,name,_) in system::tweak_values(key,"enabled")? {values.push(json!({"ключ":key,"значение":system::snapshot("HKCU",&path,&name)?}));}} }
             Ok(outcome(Status::PASS,"Прочитаны значения всех твиков каталога",pretty(&values)))
         }
         "restore" => restore_readonly(),
@@ -1200,3 +1200,581 @@ mod real_tests {
         assert!(path.exists());assert_eq!(read_journal(&path).unwrap().id,j.id);
     }
 }
+// Приёмка не включена в list(), real_list() или selftest().
+pub mod acceptance {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[derive(Clone, Serialize, Deserialize)]
+    pub struct Row {
+        pub step: String, pub check: String, pub expected: String, pub fact: String,
+        pub status: Status, pub detail: String, pub discrepancy: bool,
+    }
+    #[derive(Clone, Default, Serialize, Deserialize)]
+    pub struct AcceptanceState {
+        pub active: bool, pub stopping: bool, pub id: String, pub profile: String,
+        pub step: String, pub completed: Vec<String>, pub rows: Vec<Row>, pub log: Vec<Log>,
+        pub host: Value, pub baseline: Value, pub dirty: Vec<String>, pub manual: Vec<String>,
+        pub first: Option<engine::Run>, pub second: Option<engine::Run>,
+        pub report_path: String, pub error: String,
+    }
+    struct Prepared {
+        config: model::Config, plan: engine::Plan, host: Value, token: String, created: Instant,
+    }
+    #[derive(Default)]
+    pub struct Acceptance {
+        state: Mutex<AcceptanceState>, stop: AtomicBool, prepared: Mutex<Option<Prepared>>,
+    }
+    pub fn code_ok(word: &str, is_vm: bool, real_ack: bool) -> bool {
+        word == "ПРИЁМКА" && (is_vm || real_ack)
+    }
+    pub fn is_vm(manufacturer: &str, model: &str, bios: &str) -> bool {
+        let all=format!("{manufacturer} {model} {bios}").to_lowercase();
+        ["vmware","virtualbox","innotek","qemu","kvm","hyper-v"].iter().any(|s|all.contains(s))
+            || (manufacturer.eq_ignore_ascii_case("Microsoft Corporation")
+                && model.eq_ignore_ascii_case("Virtual Machine"))
+    }
+    fn cleanliness(present: &[String], unknown: usize) -> (Status,String) {
+        if !present.is_empty() { (Status::WARN,format!("Нечистая: {}",present.join("; "))) }
+        else if unknown>0 { (Status::WARN,format!("Чистота не подтверждена: независимой проверки нет для {unknown} программ")) }
+        else { (Status::PASS,"Чистая: ни одной программы и папки профиля".into()) }
+    }
+    fn host() -> Result<Value> {
+        let mut h=ps(r#"$c=Get-CimInstance Win32_ComputerSystem;$b=Get-CimInstance Win32_BIOS;@{manufacturer=[string]$c.Manufacturer;model=[string]$c.Model;bios=([string]$b.Manufacturer+' '+[string]$b.SMBIOSBIOSVersion+' '+[string]$b.Name);admin=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)}|ConvertTo-Json"#,Duration::from_secs(20))?;
+        h["is_vm"]=json!(is_vm(h["manufacturer"].as_str().unwrap_or(""),h["model"].as_str().unwrap_or(""),h["bios"].as_str().unwrap_or("")));
+        Ok(h)
+    }
+    impl Acceptance {
+        pub fn state(&self)->AcceptanceState { sanitized(self.state.lock().unwrap_or_else(|e|e.into_inner()).clone()) }
+        pub fn active(&self)->bool { self.state.lock().unwrap_or_else(|e|e.into_inner()).active }
+        pub fn stop(&self) { self.stop.store(true,Ordering::SeqCst);self.state.lock().unwrap().stopping=true; }
+        fn log(&self,status:Status,message:impl Into<String>) {
+            self.state.lock().unwrap().log.push(Log{time:chrono::Local::now().to_rfc3339(),level:status,message:storage::redact(&message.into())});
+        }
+        fn row(&self,step:&str,check:impl Into<String>,expected:impl Into<String>,fact:impl Into<String>,status:Status,detail:impl Into<String>,discrepancy:bool) {
+            let row=sanitized(Row{step:step.into(),check:check.into(),expected:expected.into(),fact:fact.into(),status,detail:detail.into(),discrepancy});
+            self.log(status,format!("{} · {}: {}",step,row.check,row.fact));
+            self.state.lock().unwrap().rows.push(row);
+        }
+        fn begin(&self,step:&str)->Result<()> {
+            ensure!(!self.stop.load(Ordering::SeqCst),"Приёмка остановлена между шагами; сверяйте отчёт и идентификатор первого прогона для ручного отката");
+            self.state.lock().unwrap().step=step.into();self.log(Status::PASS,format!("Начат шаг {step}"));Ok(())
+        }
+        fn complete(&self,root:&Path,step:&str)->Result<()> {
+            self.state.lock().unwrap().completed.push(step.into());self.save(root)?;Ok(())
+        }
+        fn timed<T:Send>(&self,root:&Path,step:&str,seconds:u64,work:impl FnOnce()->Result<T>+Send)->Result<T> {
+            std::thread::scope(|scope| {
+                let (tx,rx)=std::sync::mpsc::sync_channel(1);
+                scope.spawn(move || {
+                    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .unwrap_or_else(|_|Err(anyhow::anyhow!("Ошибка потока шага приёмки")));
+                    let _=tx.send(result);
+                });
+                match rx.recv_timeout(Duration::from_secs(seconds)) {
+                    Ok(result)=>result,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>{
+                        self.row(step,"Тайм-аут шага",format!("До {seconds} с"),"Лимит истёк",Status::FAIL,
+                            "Последующие действия не начинаются. Ожидание текущего чтения/отката: Rust-поток не прерывается небезопасным способом.",false);
+                        if !self.state().id.is_empty(){let _=self.save(root);}
+                        let _=rx.recv();
+                        bail!("Тайм-аут шага {step}: {seconds} с; текущая операция завершена")
+                    }
+                    Err(err)=>Err(err.into()),
+                }
+            })
+        }
+        pub fn prepare(&self,e:&engine::Engine,profile:&str)->Result<Value> {
+            ensure!(!self.active() && !e.busy.load(Ordering::SeqCst),"Дождитесь завершения текущего прогона");
+            let c=storage::load(&e.root)?;
+            ensure!(c.application.dev_mode,"Включите и сохраните режим разработчика");
+            let host=host()?;ensure!(host["admin"]==true,"Приёмка требует прав администратора");
+            let plan=self.timed(&e.root,"Подготовка",60,||engine::plan(&c,profile,false))?;
+            let selected=c.profiles.iter().find(|p|p.name==profile).context("Нет профиля")?;
+            let token=format!("{:032x}",rand::random::<u128>());
+            let answer=json!({"token":token,"host":host,"plan":plan,"needs_password":selected.restore_backup,
+                "needs_winget":plan.readiness["winget"]!=true && plan.tasks.iter().any(|t|matches!(&t.action,engine::Action::Program(k) if c.programs.iter().any(|p|p.key==*k && ["winget","msstore"].contains(&p.source.as_str()))))});
+            *self.prepared.lock().unwrap()=Some(Prepared{config:c,plan,host,token,created:Instant::now()});
+            Ok(sanitized(answer))
+        }
+        pub fn save(&self,root:&Path)->Result<String> {
+            let mut state=self.state();ensure!(!state.id.is_empty(),"Приёмка ещё не запускалась");
+            let logs=root.join("logs");model::no_links(&logs)?;fs::create_dir_all(&logs)?;
+            let md=logs.join(format!("{}.md",state.id));state.report_path=md.display().to_string();
+            storage::atomic(&logs.join(format!("{}.json",state.id)),&serde_json::to_vec_pretty(&state)?,false)?;
+            storage::atomic(&md,report(&state).as_bytes(),false)?;
+            self.state.lock().unwrap().report_path=state.report_path;
+            let re=regex::Regex::new(r"^acceptance-\d{8}-\d{6}\.(json|md)$")?;
+            let mut ids=BTreeSet::new();
+            for file in fs::read_dir(&logs)? {let file=file?;let name=file.file_name().to_string_lossy().into_owned();
+                if file.file_type()?.is_file() && re.is_match(&name) {ids.insert(name.rsplit_once('.').unwrap().0.to_owned());}}
+            let count=ids.len().saturating_sub(5);
+            for id in ids.into_iter().take(count) {for ext in ["json","md"] {let path=logs.join(format!("{id}.{ext}"));model::no_links(&path)?;if path.is_file(){fs::remove_file(path)?;}}}
+            Ok(md.display().to_string())
+        }
+    }
+    pub fn report(s:&AcceptanceState)->String {
+        let s=sanitized(s.clone());
+        let cell=|s:&str|s.replace('|'," / ").replace(['\r','\n']," ");
+        let mut out=format!("# Приёмка чистой Windows — {}\n\nПрофиль: {}\n\nШаг: {}; завершены: {}\n\n**Установки и удаления Appx НЕ ОТКАТЫВАЮТСЯ.**\n\n",s.id,s.profile,s.step,s.completed.join(", "));
+        if !s.dirty.is_empty(){out.push_str(&format!("## ВНИМАНИЕ: НЕЧИСТАЯ СИСТЕМА\n\n{}\n\n",s.dirty.join("\n\n")));}
+        out.push_str(&format!("Окружение: {}\n\n",pretty(&s.host)));
+        for status in [Status::PASS,Status::FAIL,Status::WARN,Status::SKIP] {out.push_str(&format!("{status:?}: {}  \n",s.rows.iter().filter(|r|r.status==status).count()));}
+        out.push_str("\n| Проверка | Ожидание | Факт | Статус |\n|---|---|---|---|\n");
+        for r in &s.rows {out.push_str(&format!("| {} · {} | {} | {} | {:?} |\n",r.step,cell(&r.check),cell(&r.expected),cell(&r.fact),r.status));}
+        for r in &s.rows {out.push_str(&format!("\n### {} · {}{}\n\n{}\n\n",r.step,r.check,if r.discrepancy {" — РАСХОЖДЕНИЕ"}else{""},r.detail));}
+        out.push_str(&format!("\n## Требуют ручной установки или проверки\n\n{}\n\n",if s.manual.is_empty(){"Нет".into()}else{s.manual.join("\n\n")}));
+        for (name,run) in [("Первый",s.first),("Повторный",s.second)] {if let Some(run)=run {out.push_str(&format!("## {name} прогон: заявление программы ({})\n\n{}\n\n",run.id,pretty(&run.tasks)));}}
+        out.push_str(&format!("## Живой журнал\n\n{}\n\n{}\n",s.log.iter().map(|l|format!("{} [{:?}] {}",l.time,l.level,l.message)).collect::<Vec<_>>().join("\n"),s.error));
+        storage::redact(&out)
+    }
+    #[cfg(test)]
+    mod guards_tests {
+        use super::*;
+        #[test] fn confirmation_requires_exact_word_and_physical_ack() {
+            assert!(code_ok("ПРИЁМКА",true,false));assert!(code_ok("ПРИЁМКА",false,true));
+            for word in ["приёмка","ПРИЕМКА","ПРИЁМКА ",""] {assert!(!code_ok(word,true,true));}
+            assert!(!code_ok("ПРИЁМКА",false,false));
+        }
+        #[test] fn virtual_machine_identification_uses_hardware_strings() {
+            for (m,n,b) in [("VMware, Inc.","VMware Virtual Platform",""),("innotek GmbH","VirtualBox",""),("QEMU","Standard PC",""),("Red Hat","KVM",""),("Microsoft Corporation","Virtual Machine","")] {assert!(is_vm(m,n,b));}
+            assert!(!is_vm("Microsoft Corporation","Surface Pro","UEFI"));
+            assert!(!is_vm("ASUS","ROG","American Megatrends"));
+        }
+        #[test] fn clean_verdict_never_hides_unknown_or_existing_items() {
+            assert_eq!(cleanliness(&[],0).0,Status::PASS);
+            assert_eq!(cleanliness(&["Git".into()],0).0,Status::WARN);
+            assert_eq!(cleanliness(&[],1).0,Status::WARN);
+        }
+    }
+
+    // Независимая таблица: не вызывает system::installed, installed_evidence или winget list.
+    struct EvidenceRule { id:&'static str, names:&'static [&'static str], publishers:&'static [&'static str], source:&'static str }
+    const EVIDENCE: &[EvidenceRule] = &[
+        EvidenceRule{id:"Mozilla.Firefox",names:&[],publishers:&[],source:"https://support.mozilla.org/en-US/kb/firefox-wont-start-find-solutions"},
+        EvidenceRule{id:"Vendicated.Vencord",names:&[],publishers:&[],source:"https://github.com/Vencord/Installer/blob/main/patcher.go"},
+        EvidenceRule{id:"JetBrains.IntelliJIDEA",names:&[],publishers:&[],source:"Независимой проверки нет: не зафиксированы точные имена для редакций и версий IDEA"},
+        EvidenceRule{id:"CharlesMilette.TranslucentTB",names:&[],publishers:&[],source:"Независимой проверки нет: для пакетной установки не зафиксирован исполняемый файл"},
+        EvidenceRule{id:"File-New-Project.EarTrumpet",names:&[],publishers:&[],source:"Независимой проверки нет: для пакетной установки не зафиксирован исполняемый файл"},
+        EvidenceRule{id:"9MVS1J51GMK6",names:&[],publishers:&[],source:"Независимой проверки нет: не зафиксирован надёжный признак Store-установки ngrok"},
+        EvidenceRule{id:"Valve.Steam",names:&["Steam"],publishers:&["Valve Corporation"],source:"https://github.com/microsoft/winget-pkgs/blob/master/manifests/v/Valve/Steam/2.10.91.91/Valve.Steam.locale.en-US.yaml"},
+        EvidenceRule{id:"Discord.Discord",names:&["Discord"],publishers:&["Discord Inc."],source:"https://github.com/microsoft/winget-pkgs/tree/master/manifests/d/Discord/Discord"},
+        EvidenceRule{id:"Anthropic.Claude",names:&["Claude"],publishers:&["Anthropic PBC","Anthropic, PBC"],source:"https://github.com/microsoft/winget-pkgs/blob/master/manifests/a/Anthropic/Claude/1.7196.3/Anthropic.Claude.installer.yaml"},
+        EvidenceRule{id:"Telegram.TelegramDesktop",names:&["Telegram Desktop"],publishers:&["Telegram FZ-LLC"],source:"https://github.com/telegramdesktop/tdesktop/blob/dev/Telegram/build/setup.iss"},
+        EvidenceRule{id:"Git.Git",names:&["Git"],publishers:&["The Git Development Community"],source:"https://github.com/git-for-windows/build-extra/blob/main/installer/install.iss"},
+        EvidenceRule{id:"Google.Chrome",names:&["Google Chrome"],publishers:&["Google LLC"],source:"https://chromium.googlesource.com/chromium/src/+/main/chrome/installer/util/google_chrome_distribution.cc"},
+        EvidenceRule{id:"XP8CLZL93F5Z4P",names:&["NVIDIA App"],publishers:&["NVIDIA Corporation"],source:"https://www.nvidia.com/en-us/software/nvidia-app/"},
+        EvidenceRule{id:"Asus.ArmouryCrate",names:&["ARMOURY CRATE","ArmouryCrate"],publishers:&["ASUSTeK COMPUTER INC.","ASUS"],source:"https://github.com/microsoft/winget-pkgs/blob/master/manifests/a/Asus/ArmouryCrate/6.5.7.0/Asus.ArmouryCrate.locale.en-US.yaml"},
+    ];
+    #[derive(Clone,Serialize,Deserialize)]
+    struct Fact { key:String,name:String,present:Option<bool>,occupied:bool,detail:String,source:String }
+    #[derive(Clone,Serialize,Deserialize,PartialEq,Debug)]
+    struct RegistryFact { hive:String,path:String,name:String,key_exists:bool,value:Option<(u32,Vec<u8>)> }
+    #[derive(Clone,Serialize,Deserialize)]
+    struct Snapshot {
+        programs:Vec<Fact>,folders:Vec<(String,bool,bool)>,registry:Vec<RegistryFact>,
+        displays:Vec<system::Display>,appx:Vec<String>,installed_set:BTreeSet<String>,
+    }
+    fn inventory_independent()->Result<Value> {
+        ps(r#"
+$roots=@('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+$arp=@(foreach($root in $roots){if(Test-Path -LiteralPath $root){Get-ItemProperty ($root+'\*') -ErrorAction Stop|Where-Object {$_.DisplayName}|ForEach-Object {@{name=[string]$_.DisplayName;publisher=[string]$_.Publisher;version=[string]$_.DisplayVersion;location=[string]$_.InstallLocation;key=[string]$_.PSPath}}}})
+$packages=@(Get-AppxPackage -ErrorAction Stop|ForEach-Object {@{name=[string]$_.Name;family=[string]$_.PackageFamilyName;full=[string]$_.PackageFullName}})
+$git=@(foreach($root in @('HKLM:\SOFTWARE\GitForWindows','HKCU:\SOFTWARE\GitForWindows')){if(Test-Path -LiteralPath $root){[string](Get-ItemProperty -LiteralPath $root -ErrorAction Stop).InstallPath}})
+@{arp=$arp;appx=$packages;git=$git}|ConvertTo-Json -Depth 5
+"#,Duration::from_secs(30))
+    }
+    fn field<'a>(v:&'a Value,key:&str)->&'a str {v[key].as_str().unwrap_or("")}
+    fn exact_registry(p:&model::Program,rule:&EvidenceRule,row:&Value)->bool {
+        let name=field(row,"name");
+        let version=field(row,"version");
+        let name_matches=rule.names.iter().any(|n|name.eq_ignore_ascii_case(n))
+            || (p.id=="Git.Git" && !version.is_empty() && name.eq_ignore_ascii_case(&format!("Git version {version}")))
+            || (p.id=="XP8CLZL93F5Z4P" && !version.is_empty() && name.eq_ignore_ascii_case(&format!("NVIDIA App {version}")));
+        name_matches && rule.publishers.iter().any(|v|field(row,"publisher").eq_ignore_ascii_case(v))
+    }
+    fn file_exists(path:&Path)->Result<bool> {
+        match fs::metadata(path) {Ok(m)=>Ok(m.is_file() && m.len()>0),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(false),Err(e)=>Err(e.into())}
+    }
+    fn vencord_fact()->Result<(bool,String)> {
+        let root=PathBuf::from(std::env::var_os("LOCALAPPDATA").context("Нет LOCALAPPDATA")?).join("Discord");
+        if !root.try_exists()? {return Ok((false,"Каталог стабильного Discord отсутствует".into()));}
+        let mut versions=Vec::new();
+        for entry in fs::read_dir(&root)?.take(1000) {
+            let entry=entry?;if !entry.file_type()?.is_dir(){continue;}
+            let name=entry.file_name().to_string_lossy().into_owned();
+            if let Some(number)=name.strip_prefix("app-") {
+                if let Ok(parts)=number.split('.').map(str::parse::<u32>).collect::<std::result::Result<Vec<_>,_>>() {
+                    if file_exists(&entry.path().join("Discord.exe"))? {versions.push((parts,entry.path()));}
+                }
+            }
+        }
+        versions.sort_by(|a,b|a.0.cmp(&b.0));
+        let Some((_,app))=versions.last() else {return Ok((false,"Нет стабильной app-* с Discord.exe".into()));};
+        let resources=app.join("resources");let asar=resources.join("app.asar");let original=resources.join("_app.asar");
+        if !file_exists(&asar)? || !file_exists(&original)? {return Ok((false,format!("Нет пары app.asar / _app.asar в {}",resources.display())));}
+        if fs::metadata(&asar)?.len()>1024*1024 {return Ok((false,"app.asar не является небольшим загрузчиком Vencord".into()));}
+        let bytes=fs::read(&asar)?;let text=String::from_utf8_lossy(&bytes);
+        let requires=regex::Regex::new(r#"require\(\s*("(?:\\.|[^"\\])*")\s*\)"#)?;
+        for capture in requires.captures_iter(&text) {
+            let path: String=serde_json::from_str(&capture[1])?;
+            let path=PathBuf::from(path);
+            if path.is_absolute() && path.file_name().map(|n|n=="patcher.js").unwrap_or(false)
+                && path.parent().and_then(Path::file_name).map(|n|n=="dist").unwrap_or(false) && file_exists(&path)? {
+                return Ok((true,format!("{} ссылается на непустой {}; рядом {}",asar.display(),path.display(),original.display())));
+            }
+        }
+        Ok((false,format!("{}: ссылка require на существующий dist\\patcher.js не подтверждена",asar.display())))
+    }
+    fn program_fact(p:&model::Program,c:&model::Config,inv:&Value)->Result<Fact> {
+        let mut fact=Fact{key:p.key.clone(),name:p.name.clone(),present:None,occupied:false,detail:"Независимой проверки нет; путь не угадывается".into(),source:"Нет подтверждённого признака для этого идентификатора/типа установки".into()};
+        if p.source=="winget" && p.id=="Vendicated.Vencord" {
+            let (found,detail)=vencord_fact()?;fact.present=Some(found);fact.occupied=found;fact.detail=detail;
+            fact.source="https://github.com/Vencord/Installer/blob/main/patcher.go ; критерий из задания".into();return Ok(fact);
+        }
+        if p.source=="winget" && p.id=="Mozilla.Firefox" {
+            fact.source="https://support.mozilla.org/en-US/kb/firefox-wont-start-find-solutions".into();
+            let mut paths=vec![];
+            for key in ["ProgramFiles","ProgramFiles(x86)"] {if let Some(base)=std::env::var_os(key){paths.push(PathBuf::from(base).join("Mozilla Firefox/firefox.exe"));}}
+            if !p.location.is_empty(){paths.push(model::resolve(&p.location,c)?.join("firefox.exe"));}
+            let mut found=vec![];
+            for path in &paths {if file_exists(path)?{found.push(path.display().to_string());}}
+            fact.occupied=!found.is_empty();fact.present=if p.version.is_empty(){Some(fact.occupied)}else{None};
+            fact.detail=format!("Документированный firefox.exe: {}; проверены: {}{}",found.join("; "),paths.iter().map(|p|p.display().to_string()).collect::<Vec<_>>().join("; "),if p.version.is_empty(){""}else{"; закреплённая версия этим признаком не проверяется"});
+            return Ok(fact);
+        }
+        let Some(rule)=EVIDENCE.iter().find(|r|r.id==p.id && (p.source=="winget" || (["XP8CLZL93F5Z4P","9MVS1J51GMK6"].contains(&p.id.as_str()) && p.source=="msstore"))) else {return Ok(fact);};
+        fact.source=rule.source.into();
+        if rule.names.is_empty(){return Ok(fact);}
+        let rows:Vec<_>=inv["arp"].as_array().context("Нет списка Uninstall")?.iter().filter(|v|exact_registry(p,rule,v)).collect();
+        fact.occupied=!rows.is_empty();
+        fact.present=Some(rows.iter().any(|r|p.version.is_empty() || field(r,"version")==p.version));
+        fact.detail=format!("Точные имена {:?}, издатели {:?}; Uninstall HKLM/HKLM WOW6432Node/HKCU: {}",rule.names,rule.publishers,pretty(&rows));
+        // Наличие MSIX Claude не выдаём за отсутствие классического приложения.
+        if p.id=="Anthropic.Claude" && !fact.occupied && inv["appx"].as_array().into_iter().flatten().any(|p|field(p,"family")=="Claude_pzs8sxrjxfjjc") {
+            fact.occupied=true;fact.present=None;fact.detail.push_str("; найден MSIX Claude: классический Uninstall неприменим, независимой проверки исполняемого файла MSIX нет");
+        }
+        if p.id=="Asus.ArmouryCrate" && !fact.occupied && inv["appx"].as_array().into_iter().flatten().any(|p|field(p,"name").to_lowercase().ends_with(".armourycrate")) {
+            fact.present=None;fact.detail.push_str("; есть похожий пакет Appx ArmouryCrate: это не доказательство установки, независимой проверки его исполняемого файла нет");
+        }
+        if p.id=="Git.Git" {
+            let mut paths=Vec::new();
+            for value in inv["git"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|s|!s.is_empty()) {paths.push(PathBuf::from(value).join("cmd/git.exe"));}
+            for key in ["ProgramFiles","ProgramFiles(x86)"] {if let Some(base)=std::env::var_os(key){paths.push(PathBuf::from(base).join("Git/cmd/git.exe"));}}
+            if !p.location.is_empty(){paths.push(model::resolve(&p.location,c)?.join("cmd/git.exe"));}
+            paths.sort();paths.dedup();
+            let mut valid=false;let re=regex::Regex::new(r"(?m)^git version \d+\.\d+\.\d+(?:[.\w-]*)\s*$")?;
+            for path in paths {
+                if !file_exists(&path)?{continue;}
+                fact.occupied=true;
+                let mut cmd=Command::new(&path);cmd.arg("--version");
+                let (ok,out)=command(cmd,Duration::from_secs(15))?;
+                let reported=out.trim().strip_prefix("git version ").unwrap_or("");
+                let version_ok=p.version.is_empty() || reported==p.version || reported.starts_with(&format!("{}.windows.",p.version));
+                valid|=ok && re.is_match(out.trim()) && version_ok;
+                fact.detail.push_str(&format!("\n{} --version: успех={ok}; {}",path.display(),out.trim()));
+            }
+            fact.present=Some(valid);
+        }
+        Ok(fact)
+    }
+    fn read_registry(hive:&str,path:&str,name:&str)->Result<RegistryFact> {
+        use winreg::{RegKey,enums::*};
+        let root=RegKey::predef(match hive {"HKCU"=>HKEY_CURRENT_USER,"HKLM"=>HKEY_LOCAL_MACHINE,_=>bail!("Неизвестный раздел реестра")});
+        let mut fact=RegistryFact{hive:hive.into(),path:path.into(),name:name.into(),key_exists:false,value:None};
+        match root.open_subkey_with_flags(path,KEY_READ) {
+            Ok(key)=>{fact.key_exists=true;match key.get_raw_value(name){Ok(v)=>fact.value=Some((v.vtype as u32,v.bytes.to_vec())),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},Err(e)=>return Err(e.into())}},
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},Err(e)=>return Err(e.into()),
+        }
+        Ok(fact)
+    }
+    fn expected_registry(c:&model::Config,profile:&str)->Result<Vec<(String,String,String,Option<u32>)>> {
+        let p=c.profiles.iter().find(|p|p.name==profile).context("Нет профиля")?;
+        let mut targets=vec![];let root=r"Software\Microsoft\Windows\CurrentVersion";
+        for (key,state) in &p.windows_tweaks {
+            if state=="keep" || key=="max_refresh" {continue;}
+            let value=if state=="enabled"{1}else{0};
+            let app=match key.as_str() {"notify_snip"=>Some("Microsoft.ScreenSketch_8wekyb3d8bbwe!App"),"notify_discord"=>Some("com.squirrel.Discord.Discord"),"notify_telegram"=>Some("Telegram.TelegramDesktop"),_=>None};
+            if let Some(app)=app {targets.push(("HKCU".into(),format!(r"{root}\Notifications\Settings\{app}"),"Enabled".into(),Some(value)));}
+            else if key=="suggestions" {
+                for name in ["SoftLandingEnabled","SubscribedContent-338389Enabled","SubscribedContent-310093Enabled","SubscribedContent-338388Enabled","SubscribedContent-353694Enabled","SubscribedContent-353696Enabled","SystemPaneSuggestionsEnabled","SilentInstalledAppsEnabled","ContentDeliveryAllowed"] {
+                    targets.push(("HKCU".into(),format!(r"{root}\ContentDeliveryManager"),name.into(),Some(value)));
+                }
+                for (path,name) in [("UserProfileEngagement","ScoobeSystemSettingEnabled"),(r"Explorer\Advanced","ShowSyncProviderNotifications"),("Privacy","TailoredExperiencesWithDiagnosticDataEnabled")] {
+                    targets.push(("HKCU".into(),format!(r"{root}\{path}"),name.into(),Some(value)));
+                }
+            } else {bail!("Нет независимой спецификации твика {key}");}
+        }
+        for key in &p.autostart {let a=c.autostart.iter().find(|a|&a.key==key).context("Нет записи автозапуска")?;
+            targets.push((a.hive.clone(),format!(r"{root}\Explorer\StartupApproved\{}",a.category),a.name.clone(),None));}
+        Ok(targets)
+    }
+    fn snapshot_independent(c:&model::Config,profile:&str)->Result<Snapshot> {
+        let begin=Instant::now();let p=c.profiles.iter().find(|p|p.name==profile).context("Нет профиля")?;
+        let inv=inventory_independent()?;
+        let mut programs=vec![];
+        for key in &p.programs {
+            ensure!(begin.elapsed()<Duration::from_secs(180),"Тайм-аут независимого чтения 180 с");
+            let program=c.programs.iter().find(|v|&v.key==key).context("Нет программы")?;
+            programs.push(program_fact(program,c,&inv)?);
+        }
+        let mut folders=vec![];
+        for key in &p.paths {let folder=c.paths.iter().find(|v|&v.key==key).context("Нет папки")?;let path=model::resolve(&folder.path,c)?;
+            let (exists,is_dir)=match fs::metadata(&path){Ok(m)=>(true,m.is_dir()),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>(false,false),Err(e)=>return Err(e.into())};
+            folders.push((path.display().to_string(),exists,is_dir));}
+        let registry=expected_registry(c,profile)?.into_iter().map(|(h,p,n,_)|read_registry(&h,&p,&n)).collect::<Result<Vec<_>>>()?;
+        let packages=inv["appx"].as_array().context("Нет списка Appx")?;
+        let appx=packages.iter().map(|p|field(p,"name").to_string()).collect::<Vec<_>>();
+        let mut installed_set=BTreeSet::new();
+        for r in inv["arp"].as_array().context("Нет списка Uninstall")? {installed_set.insert(format!("Uninstall|{}|{}|{}|{}",field(r,"key"),field(r,"name"),field(r,"publisher"),field(r,"version")));}
+        for r in packages {installed_set.insert(format!("Appx|{}",field(r,"full")));}
+        ensure!(begin.elapsed()<Duration::from_secs(180),"Тайм-аут независимого чтения 180 с");
+        Ok(Snapshot{programs,folders,registry,displays:system::displays(),appx,installed_set})
+    }
+    fn verdict(claim:&str,fact:Option<bool>,hardware:bool,vm:bool)->(Status,bool,String) {
+        let Some(found)=fact else{return (Status::SKIP,false,"Независимой проверки нет".into());};
+        let declared=match claim {"succeeded"|"skipped"=>Some(true),"failed"|"needs_verification"=>Some(false),_=>None};
+        if declared.map(|v|v!=found).unwrap_or(false) {return (Status::FAIL,true,format!("Расхождение: заявление {claim}, независимый факт — {}",if found{"найдена"}else{"не найдена"}));}
+        if found {(Status::PASS,false,"Наличие подтверждено независимо".into())}
+        else if hardware && vm {(Status::WARN,false,"Не найдена: в VM требуется ручная установка или проверка оборудования".into())}
+        else {(Status::FAIL,false,"Не найдена независимой проверкой".into())}
+    }
+    fn idempotence(failed:bool,new_install:bool,removed:bool,same_set:bool,first_ms:u64,second_ms:u64)->Status {
+        if failed || new_install || removed || !same_set || second_ms>=first_ms {Status::FAIL}else{Status::PASS}
+    }
+    #[cfg(test)]
+    mod facts_tests {
+        use super::*;
+        #[test] fn claims_are_compared_with_independent_facts() {
+            assert_eq!(verdict("skipped",Some(false),false,true).0,Status::FAIL);
+            assert!(verdict("succeeded",Some(false),false,true).1);
+            assert!(verdict("failed",Some(true),false,true).1);
+            assert!(verdict("needs_verification",Some(true),false,true).1);
+            assert_eq!(verdict("succeeded",None,false,true).0,Status::SKIP);
+            assert_eq!(verdict("succeeded",Some(true),false,true).0,Status::PASS);
+        }
+        #[test] fn hardware_exception_does_not_hide_a_false_positive() {
+            for _id in ["XP8CLZL93F5Z4P","Asus.ArmouryCrate"] {
+                assert_eq!(verdict("failed",Some(false),true,true).0,Status::WARN);
+                assert_eq!(verdict("failed",Some(false),true,false).0,Status::FAIL);
+                assert_eq!(verdict("succeeded",Some(false),true,true).0,Status::FAIL);
+            }
+        }
+        #[test] fn repeat_verdict_checks_each_requirement() {
+            assert_eq!(idempotence(false,false,false,true,200,100),Status::PASS);
+            for (f,i,r,s,a,b) in [(true,false,false,true,200,100),(false,true,false,true,200,100),(false,false,true,true,200,100),(false,false,false,false,200,100),(false,false,false,true,100,100)] {
+                assert_eq!(idempotence(f,i,r,s,a,b),Status::FAIL);
+            }
+        }
+        #[test] fn exact_evidence_rejects_related_apps_and_unknown_publisher() {
+            let c=model::defaults();let p=c.programs.iter().find(|p|p.id=="Git.Git").unwrap();
+            let rule=EVIDENCE.iter().find(|r|r.id==p.id).unwrap();
+            assert!(exact_registry(p,rule,&json!({"name":"Git","publisher":"The Git Development Community","version":"2.47.1"})));
+            assert!(!exact_registry(p,rule,&json!({"name":"GitHub Desktop","publisher":"The Git Development Community"})));
+            assert!(!exact_registry(p,rule,&json!({"name":"Git","publisher":"Other"})));
+        }
+    }
+    impl Acceptance {
+        pub fn start(self:&Arc<Self>,e:Arc<engine::Engine>,payload:&Value)->Result<()> {
+            ensure!(!self.active() && !e.busy.load(Ordering::SeqCst),"Дождитесь завершения текущего прогона");
+            let mut slot=self.prepared.lock().unwrap();
+            let prep=slot.as_ref().context("Сначала откройте подтверждение приёмки")?;
+            ensure!(payload["token"].as_str()==Some(&prep.token) && prep.created.elapsed()<Duration::from_secs(300),"Подтверждение устарело; откройте его заново");
+            let current=storage::load(&e.root)?;
+            ensure!(current.application.dev_mode && engine::fingerprint(&current)==prep.plan.fingerprint,"Конфиг изменился или режим разработчика выключен; подтвердите новый план");
+            let latest_host=host()?;
+            ensure!(latest_host["admin"]==true,"Приёмка требует прав администратора");
+            ensure!(code_ok(payload["word"].as_str().unwrap_or(""),latest_host["is_vm"]==true,payload["real_ack"]==true),"Введите ПРИЁМКА и подтвердите реальный компьютер");
+            ensure!(latest_host["is_vm"]==prep.host["is_vm"],"Тип компьютера изменился; откройте подтверждение заново");
+            let profile=current.profiles.iter().find(|p|p.name==prep.plan.profile).context("Нет профиля")?;
+            let password=zeroize::Zeroizing::new(payload["password"].as_str().unwrap_or("").to_string());
+            ensure!(!profile.restore_backup || !password.is_empty(),"Для выбранного профиля требуется пароль Vault");
+            let needs_winget=prep.plan.readiness["winget"]!=true && prep.plan.tasks.iter().any(|t|matches!(&t.action,engine::Action::Program(k) if current.programs.iter().any(|p|p.key==*k && ["winget","msstore"].contains(&p.source.as_str()))));
+            ensure!(!needs_winget || payload["winget_consent"]==true,"Подтвердите подготовку winget");
+            let prep=slot.take().unwrap();drop(slot);
+            let mut now=chrono::Local::now();
+            let id=loop {let id=now.format("acceptance-%Y%m%d-%H%M%S").to_string();
+                if !["json","md"].iter().any(|ext|e.root.join("logs").join(format!("{id}.{ext}")).exists()){break id;}
+                now+=chrono::Duration::seconds(1);};
+            self.stop.store(false,Ordering::SeqCst);
+            *self.state.lock().unwrap()=AcceptanceState{active:true,id,profile:prep.plan.profile.clone(),host:latest_host,..Default::default()};
+            if let Err(err)=self.save(&e.root){self.state.lock().unwrap().active=false;return Err(err);}
+            let this=self.clone();let no_point=payload["no_point_ok"]==true;let winget=payload["winget_consent"]==true;
+            let root=e.root.clone();
+            let spawned=std::thread::Builder::new().name("winsetup-acceptance".into()).spawn(move || {
+                let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||this.sequence(&e,prep,&password,no_point,winget)))
+                    .unwrap_or_else(|_|Err(anyhow::anyhow!("Внутренняя ошибка приёмки")));
+                if let Err(err)=result {
+                    let step=this.state().step;let detail=storage::redact(&format!("{err:#}"));
+                    this.row(&step,"Приёмка","Все шаги завершены",&detail,if this.stop.load(Ordering::SeqCst){Status::SKIP}else{Status::FAIL},&detail,false);
+                    this.state.lock().unwrap().error=detail;
+                }
+                // Не разрешаем конкурирующие записи, пока обычный движок завершает свою задачу.
+                if e.busy.load(Ordering::SeqCst) {
+                    e.cancel.store(true,Ordering::SeqCst);this.log(Status::FAIL,"Ожидание завершения текущей задачи движка; параллельные действия заблокированы");
+                    let _=this.save(&e.root);
+                    while e.busy.load(Ordering::SeqCst){std::thread::sleep(Duration::from_millis(500));}
+                }
+                let first_id=this.state().first.as_ref().map(|r|r.id.clone());
+                if !this.state().completed.iter().any(|s|s=="E") {
+                    this.log(Status::WARN,format!("Откат первого прогона не подтверждён. Идентификатор для отката через Историю: {}",first_id.as_deref().unwrap_or("первый прогон не запускался")));
+                }
+                this.state.lock().unwrap().active=false;
+                if let Err(err)=this.save(&e.root) {this.state.lock().unwrap().error=format!("Не удалось сохранить отчёт: {err}");}
+            });
+            if let Err(err)=spawned {self.state.lock().unwrap().active=false;self.state.lock().unwrap().error=err.to_string();let _=self.save(&root);return Err(err.into());}
+            Ok(())
+        }
+        fn profile_pass(&self,e:&Arc<engine::Engine>,c:&model::Config,plan:engine::Plan,password:&str,no_point:bool,winget:bool,second:bool)->Result<(engine::Run,u64)> {
+            ensure!(engine::fingerprint(&storage::load(&e.root)?)==engine::fingerprint(c),"Рабочий конфиг изменён извне; приёмка остановлена");
+            let start=Instant::now();
+            let id=engine::start(e.clone(),c.clone(),plan,true,password.to_string(),None,false,no_point,winget)?;
+            if let Some(run)=e.state(){if second {self.state.lock().unwrap().second=Some(run);}else{self.state.lock().unwrap().first=Some(run);}}
+            self.save(&e.root)?;
+            self.log(Status::PASS,format!("Обычный движок запущен, идентификатор {id}"));
+            let mut count=0;let mut timed_out=false;let mut saved=Instant::now();
+            loop {
+                let run=e.state().context("Движок потерял состояние")?;
+                ensure!(run.id==id,"Идентификатор активного прогона изменился");
+                for line in run.log.iter().skip(count) {self.log(Status::PASS,format!("Заявление программы: {line}"));}
+                count=run.log.len();
+                if second {self.state.lock().unwrap().second=Some(run.clone());}else{self.state.lock().unwrap().first=Some(run.clone());}
+                if !e.busy.load(Ordering::SeqCst) {
+                    let finished=e.state().context("Нет итогового состояния движка")?;
+                    ensure!(finished.id==id && !finished.active,"Некорректное итоговое состояние движка");
+                    if second {self.state.lock().unwrap().second=Some(finished.clone());}else{self.state.lock().unwrap().first=Some(finished.clone());}
+                    ensure!(!timed_out,"Тайм-аут прогона 45 минут; текущая задача завершена, следующие задачи отменены");
+                    return Ok((finished,start.elapsed().as_millis() as u64));
+                }
+                if !timed_out && start.elapsed()>=Duration::from_secs(45*60) {
+                    timed_out=true;e.cancel.store(true,Ordering::SeqCst);e.pause.store(false,Ordering::SeqCst);
+                    self.row(if second{"D"}else{"B"},"Тайм-аут","До 45 минут","45 минут истекли",Status::FAIL,"Запрошена отмена между задачами. Работающий установщик не прерывается; ждём его завершения перед откатом.",false);
+                    self.save(&e.root)?;
+                }
+                if saved.elapsed()>=Duration::from_secs(15){self.save(&e.root)?;saved=Instant::now();}
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        fn compare(&self,c:&model::Config,profile:&str,before:&Snapshot,after:&Snapshot,run:&engine::Run,step:&str) ->Result<()> {
+            let vm=self.state().host["is_vm"]==true;
+            for fact in &after.programs {
+                let program=c.programs.iter().find(|p|p.key==fact.key).context("Нет программы")?;
+                let task=run.tasks.iter().find(|t|matches!(&t.action,engine::Action::Program(k) if k==&fact.key));
+                let claim=task.map(|t|t.status.as_str()).unwrap_or("нет задачи");
+                let (status,discrepancy,message)=verdict(claim,fact.present,["XP8CLZL93F5Z4P","Asus.ArmouryCrate"].contains(&program.id.as_str()),vm);
+                self.row(step,&fact.name,"Установлена; заявление совпадает с независимым фактом",format!("{message}; заявление: {claim}"),status,
+                    format!("Источник: {}\n{}\nЗаявление программы: {}",fact.source,fact.detail,task.map(|t|t.detail.as_str()).unwrap_or("нет")),discrepancy);
+                if fact.present!=Some(true){let mut s=self.state.lock().unwrap();if !s.manual.contains(&fact.name){s.manual.push(fact.name.clone());}}
+            }
+            for (path,_,is_dir) in &after.folders {
+                self.row(step,format!("Папка {path}"),"Каталог существует",if *is_dir{"Каталог существует"}else{"Каталог отсутствует или путь занят файлом"},if *is_dir{Status::PASS}else{Status::FAIL},"Независимое fs::metadata",false);
+            }
+            for (h,p,n,expected) in expected_registry(c,profile)? {
+                let actual=after.registry.iter().find(|r|r.hive==h && r.path==p && r.name==n).context("Нет снимка значения")?;
+                let matches=if let Some(value)=expected {actual.value==Some((winreg::enums::REG_DWORD as u32,value.to_le_bytes().to_vec()))}
+                    else {actual.value.as_ref().map(|(kind,bytes)|*kind==winreg::enums::REG_BINARY as u32 && bytes.first()==Some(&3)).unwrap_or(false)};
+                self.row(step,format!("{h}\\{p} → {n}"),expected.map(|v|format!("REG_DWORD {v}")).unwrap_or("StartupApproved REG_BINARY: отключено (3)".into()),pretty(actual),if matches{Status::PASS}else{Status::FAIL},"Прямое чтение winreg; ожидания заданы в таблице приёмки",false);
+            }
+            let selected=c.profiles.iter().find(|p|p.name==profile).context("Нет профиля")?;
+            for name in &selected.appx_removal {
+                if !before.appx.contains(name) {self.row(step,format!("Appx {name}"),"Отсутствует","Не было в исходном состоянии",Status::SKIP,"Установки и удаления Appx не откатываются",false);continue;}
+                let absent=!after.appx.contains(name);
+                self.row(step,format!("Appx {name}"),"Пакет удалён у текущего пользователя",if absent{"Отсутствует"}else{"Остался установлен"},if absent{Status::PASS}else{Status::FAIL},"Независимый Get-AppxPackage. Удаление не откатывается.",false);
+            }
+            if selected.windows_tweaks.get("max_refresh").map(String::as_str)==Some("enabled") {
+                if after.displays.is_empty(){self.row(step,"Частота","Есть дисплей и максимальная частота","Нет дисплеев",Status::FAIL,"EnumDisplaySettingsW",false);}
+                for d in &after.displays {
+                    let max=d.available.iter().copied().chain(std::iter::once(d.current)).filter(|v|*v>1).max();
+                    let valid=d.width>0 && d.height>0 && d.bits>0 && max==Some(d.current);
+                    self.row(step,format!("Частота {}",d.device),format!("Максимум {:?} Гц для {}×{}, {} бит",max,d.width,d.height,d.bits),
+                        format!("Текущая {} Гц",d.current),if valid{Status::PASS}else{Status::FAIL},pretty(d),false);
+                }
+            }
+            Ok(())
+        }
+        fn rollback_first(&self,e:&engine::Engine,c:&model::Config,profile:&str,before:&Snapshot)->Result<()> {
+            self.begin("E")?;
+            ensure!(!e.busy.load(Ordering::SeqCst),"Движок ещё выполняет задачу: откат не запускается параллельно");
+            let first=self.state().first.context("Нет первого прогона для отката")?;
+            let path=e.root.join("runs").join(format!("{}.rollback.json",first.id));
+            let started=Instant::now();
+            if path.try_exists()? {
+                match engine::rollback(e,&first.id) {
+                    Ok(message)=>self.row("E","Откат первого прогона","Существующий откат по ID первого запуска",message,Status::PASS,&first.id,false),
+                    Err(err)=>self.row("E","Откат первого прогона","Успешный возврат",err.to_string(),Status::FAIL,format!("Первый запуск: {}; снимок: {}",first.id,path.display()),false),
+                }
+            } else {self.row("E","Откат первого прогона","Снимок при наличии изменений","Снимок движком не создан; сверяем исходные значения",Status::WARN,&first.id,false);}
+            for original in &before.registry {
+                let actual=read_registry(&original.hive,&original.path,&original.name)?;
+                let same=&actual==original;
+                self.row("E",format!("Возврат {}\\{} → {}",original.hive,original.path,original.name),"Точное исходное значение, тип и отсутствие",if same{"Совпадает"}else{"НЕ ВОССТАНОВЛЕНО"},if same{Status::PASS}else{Status::FAIL},
+                    format!("До: {}\nПосле: {}\nПри несовпадении: восстановить исходный тип/байты; исходно отсутствующее значение удалить. Снимок первого запуска: {}",pretty(original),pretty(&actual),path.display()),false);
+            }
+            if c.profiles.iter().find(|p|p.name==profile).and_then(|p|p.windows_tweaks.get("max_refresh")).map(String::as_str)==Some("enabled") {
+                let now=system::displays();
+                for old in &before.displays {
+                    let actual=now.iter().find(|d|d.device==old.device);
+                    let same=actual.map(|d|d.current==old.current && d.width==old.width && d.height==old.height && d.bits==old.bits).unwrap_or(false);
+                    self.row("E",format!("Возврат дисплея {}",old.device),format!("{}×{}, {} бит, {} Гц",old.width,old.height,old.bits,old.current),pretty(&actual),if same{Status::PASS}else{Status::FAIL},"Исходный режим шага A",false);
+                }
+            }
+            ensure!(started.elapsed()<Duration::from_secs(180),"Откат превысил 180 с; сверяйте результаты возврата");
+            self.row("E","Необратимые действия","Установки и удаления Appx не откатываются","Не откатываются",Status::WARN,"Папки, репозитории и восстановленные файлы также не удаляются ограниченным откатом движка.",false);
+            self.complete(&e.root,"E")
+        }
+        fn sequence(&self,e:&Arc<engine::Engine>,prep:Prepared,password:&str,no_point:bool,winget:bool)->Result<()> {
+            let c=&prep.config;let profile=prep.plan.profile.clone();
+            self.begin("A")?;
+            let before=self.timed(&e.root,"A",180,||snapshot_independent(c,&profile))?;
+            let mut present=before.programs.iter().filter(|p|p.occupied).map(|p|p.name.clone()).collect::<Vec<_>>();
+            present.extend(before.folders.iter().filter(|(_,exists,_)|*exists).map(|(path,_,_)|path.clone()));
+            let unknown=before.programs.iter().filter(|p|p.present.is_none()).count();
+            let (status,message)=cleanliness(&present,unknown);
+            {let mut state=self.state.lock().unwrap();state.dirty=present;state.baseline=serde_json::to_value(&before)?;}
+            self.row("A","Исходное состояние","Ни одной программы и папок профиля",message,status,pretty(&before),false);
+            self.complete(&e.root,"A")?;
+            let middle=(||->Result<()> {
+                self.begin("B")?;
+                let (first,first_ms)=self.profile_pass(e,c,prep.plan,password,no_point,winget,false)?;
+                self.row("B","Первый прогон","Обычный движок завершил профиль",format!("{}; {} мс",first.id,first_ms),if !first.active{Status::PASS}else{Status::FAIL},pretty(&first.tasks),false);
+                self.complete(&e.root,"B")?;
+                self.begin("C")?;
+                let after=self.timed(&e.root,"C",180,||snapshot_independent(c,&profile))?;
+                self.compare(c,&profile,&before,&after,&first,"C")?;
+                self.complete(&e.root,"C")?;
+                self.begin("D")?;
+                let plan=self.timed(&e.root,"D",60,||engine::plan(c,&profile,false))?;
+                let (second,second_ms)=self.profile_pass(e,c,plan,password,no_point,winget,true)?;
+                let repeated=self.timed(&e.root,"D",180,||snapshot_independent(c,&profile))?;
+                self.compare(c,&profile,&before,&repeated,&second,"D")?;
+                let failed=second.tasks.iter().any(|t|t.status=="failed") || !second.finished;
+                let new_install=second.tasks.iter().any(|t|matches!(&t.action,engine::Action::Program(k) if c.programs.iter().any(|p|p.key==*k && p.source!="git")) && t.status!="skipped");
+                let removed=second.tasks.iter().any(|t|matches!(t.action,engine::Action::Remove(_)) && t.status!="skipped");
+                let same_set=after.installed_set==repeated.installed_set
+                    && after.programs.iter().map(|p|(&p.key,p.present,p.occupied)).eq(repeated.programs.iter().map(|p|(&p.key,p.present,p.occupied)));
+                let status=idempotence(failed,new_install,removed,same_set,first_ms,second_ms);
+                self.row("D","Идемпотентность","Нет failed, новых установок и удалений Appx; набор установленного тот же; время меньше",
+                    format!("ошибки={failed}; непропущенные установки={new_install}; непропущенные удаления={removed}; набор совпадает={same_set}; время {first_ms} → {second_ms} мс"),
+                    status,format!("Новые записи: {}\nИсчезнувшие записи: {}\nНепропущенная задача установки считается нарушением даже при неизменном наборе. Набор: все Uninstall и Appx текущего пользователя; фоновые обновления также будут видны.",
+                        pretty(&repeated.installed_set.difference(&after.installed_set).collect::<Vec<_>>()),pretty(&after.installed_set.difference(&repeated.installed_set).collect::<Vec<_>>())),false);
+                self.complete(&e.root,"D")
+            })();
+            if let Err(err)=middle {
+                let step=self.state().step;self.row(&step,"Выполнение шага","Шаг завершён",format!("{err:#}"),if self.stop.load(Ordering::SeqCst){Status::SKIP}else{Status::FAIL},"Продолжение прогона пропущено; откат первого прогона выполняется, если не нажата остановка.",false);
+            }
+            if e.busy.load(Ordering::SeqCst) {
+                e.cancel.store(true,Ordering::SeqCst);e.pause.store(false,Ordering::SeqCst);
+                self.log(Status::FAIL,"Ошибка ожидания или сохранения: отмена запрошена, ждём текущую задачу до отката");
+                let _=self.save(&e.root);
+                while e.busy.load(Ordering::SeqCst){std::thread::sleep(Duration::from_millis(500));}
+                if let Some(run)=e.state(){
+                    let mut state=self.state.lock().unwrap();
+                    if state.first.as_ref().map(|r|r.id.as_str())==Some(run.id.as_str()){state.first=Some(run);}else{state.second=Some(run);}
+                }
+            }
+            if self.state().first.is_some(){self.timed(&e.root,"E",180,||self.rollback_first(e,c,&profile,&before))?;}
+            self.begin("F")?;
+            self.log(Status::PASS,"Итог сформирован: независимые факты и заявления программы показаны отдельно");
+            self.complete(&e.root,"F")
+        }
+    }}

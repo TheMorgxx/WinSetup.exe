@@ -51,3 +51,34 @@ test('restore-point consent remains visible and separate from normal continuatio
   assert.match(html, /Продолжить без точки восстановления/);
   assert.match(html, /ожидают подтверждения/);
 });
+
+const acceptanceNames=new Set(['acceptanceConfirmationAllowed','acceptancePanel']);
+const acceptancePieces=tree.statements.filter(n=>ts.isFunctionDeclaration(n)&&acceptanceNames.has(n.name?.text)).map(n=>n.getText(tree));
+assert.equal(acceptancePieces.length,acceptanceNames.size);
+const acceptanceCompiled=ts.transpileModule(acceptancePieces.join('\n'),{compilerOptions:{target:ts.ScriptTarget.ES2020}}).outputText;
+test('acceptance requires the exact word and every applicable confirmation',()=>{
+ const context=vm.createContext({});
+ vm.runInContext(acceptanceCompiled,context);
+ const allowed=(...args)=>context.acceptanceConfirmationAllowed(...args);
+ assert.equal(allowed('ПРИЁМКА',true,false,false,false,false,''),true);
+ assert.equal(allowed('ПРИЁМКА',false,false,false,false,false,''),false);
+ assert.equal(allowed('ПРИЁМКА',false,true,false,false,false,''),true);
+ for(const word of ['ПРИЕМКА','приёмка','ПРИЁМКА ',''])assert.equal(allowed(word,true,true,false,false,false,''),false);
+ assert.equal(allowed('ПРИЁМКА',true,false,true,false,false,''),false);
+ assert.equal(allowed('ПРИЁМКА',true,false,false,false,true,''),false);
+ assert.equal(allowed('ПРИЁМКА',true,false,true,true,true,'test'),true);
+});
+test('acceptance shows discrepancies, escapes facts, and disables starting while busy',()=>{
+ const context=vm.createContext({
+  c:{profiles:[{name:'Мой ПК'}],application:{selected_profile:'Мой ПК'}},
+  acceptanceProfile:'',acceptance:{active:true,rows:[{step:'C',check:'<script>bad</script>',expected:'Да',fact:'<img src=x>',detail:'<iframe>',status:'FAIL',discrepancy:true}],log:[],completed:[],manual:[]},
+  dev:{active:false},run:null,acceptanceHideUser:true,acceptanceLevel:'all',acceptanceExpanded:new Set(),devNames:{PASS:'Пройден',FAIL:'Ошибка',WARN:'Предупреждение',SKIP:'Пропущен'}
+ });
+ vm.runInContext(compiled+'\n'+acceptanceCompiled,context);
+ const html=vm.runInContext('acceptancePanel()',context);
+ assert.match(html,/FAIL — РАСХОЖДЕНИЕ/);
+ assert.match(html,/&lt;script&gt;/);
+ assert.doesNotMatch(html,/<script>|<img |<iframe>/);
+ assert.match(html,/data-action="dev-acceptance-start"[^>]*disabled/);
+ assert.match(html,/Установки и удаления Appx не откатываются/);
+});

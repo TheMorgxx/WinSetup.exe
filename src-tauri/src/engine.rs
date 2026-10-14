@@ -308,13 +308,23 @@ pub fn plan(c: &Config, name: &str, network: bool) -> Result<Plan> {
         "Только чтение",
         Action::Final,
     );
+    let displays=system::displays();
+    for task in &mut tasks {
+        if matches!(&task.action,Action::Tweak(key,state) if key=="max_refresh" && state=="enabled") {
+            task.detail=if displays.is_empty() { "Нет доступных режимов дисплея".into() } else {
+                displays.iter().map(|d|format!("{}: {}",d.device,
+                    system::refresh_decision(d).map(|v|v.message()).unwrap_or_else(|e|e.to_string())))
+                    .collect::<Vec<_>>().join("\n")
+            };
+        }
+    }
     Ok(Plan {
         profile: p.name.clone(),
         fingerprint: fingerprint(c),
         tasks,
         warnings,
         readiness,
-        displays: system::displays(),
+        displays,
     })
 }
 fn rb_save(root: &Path, id: &str, rb: &Rollback) -> Result<()> {
@@ -476,8 +486,10 @@ fn install(e:&Engine, t:&Task, c: &Config, p: &model::Program, force: bool) -> R
         verify_program(e,p)?;
         return Ok("Установка подтверждена повторной проверкой; установщик не запускался".into());
     }
-    if !force && system::installed(p)? {
-        return Ok("Пропущено: программа найдена; установка пропущена".into());
+    if !force {
+        if let Some(evidence)=system::installed_evidence(p)? {
+            return Ok(format!("Пропущено: программа найдена; установка пропущена\nОснование: {evidence}"));
+        }
     }
     if p.key == "vencord" {
         let discord = c
@@ -615,12 +627,18 @@ fn execute(
             if key == "max_refresh" {
                 let displays = system::displays();
                 ensure!(!displays.is_empty(), "Нет доступных режимов дисплея");
+                let decisions=displays.iter().map(system::refresh_decision).collect::<Result<Vec<_>>>()?;
+                if decisions.iter().all(|d|matches!(d,system::RefreshDecision::Skip(_))) {
+                    let mut messages=decisions.iter().map(|d|d.message()).collect::<Vec<_>>();
+                    messages.dedup();
+                    return Ok(messages.join("; "));
+                }
                 if rb.displays.is_empty() {
                     rb.displays = displays.clone();
                     rb_save(&e.root, &run.id, rb)?;
                 }
-                for d in displays {
-                    system::set_display(&d, d.maximum)?;
+                for (d,decision) in displays.iter().zip(decisions) {
+                    if let system::RefreshDecision::Apply(hz)=decision { system::set_display(d,hz)?; }
                 }
                 return Ok("Частота установлена и проверена".into());
             }
@@ -680,6 +698,7 @@ fn execute(
 }
 fn check_final_programs(e:&Engine,c:&Config,run:&Run,mut inspect:impl FnMut(&model::Program)->Result<bool>)->Result<String> {
             let mut issues=Vec::new();
+            let mut errors=Vec::new();
             for task in &run.tasks {
                 if task.status=="waiting_winget" {continue;}
                 if let Action::Program(key)=&task.action {
@@ -697,7 +716,7 @@ fn check_final_programs(e:&Engine,c:&Config,run:&Run,mut inspect:impl FnMut(&mod
                             }
                         }
                         check => {
-                            let reason=match check {Err(err)=>format!("проверка недоступна: {err}"),_=>"установка пока не подтверждена".into()};
+                            let reason=match check {Err(err)=>{errors.push(format!("{}: проверка недоступна: {err}",program.name));format!("проверка недоступна: {err}")},_=>"установка пока не подтверждена".into()};
                             issues.push(format!("{}: {}",program.name,reason));
                             if ["succeeded","skipped","needs_verification"].contains(&task.status.as_str()) || verification_only(task) {
                                 if let Some(r)=e.current.lock().unwrap().as_mut() {
@@ -710,9 +729,16 @@ fn check_final_programs(e:&Engine,c:&Config,run:&Run,mut inspect:impl FnMut(&mod
                     }
                 }
             }
-            ensure!(issues.is_empty(),"Не все установки подтверждены:\n{}\nПроверьте сведения отдельных задач; установщики с успешным завершением повторно не запускаются.",issues.join("\n"));
-            Ok("Проверка выбранных программ завершена. Драйверы проверяйте для вашей модели компьютера на сайте производителя.".into())
+            final_check_summary(&issues,&errors)
         }
+fn final_check_summary(manual:&[String],errors:&[String])->Result<String> {
+    ensure!(errors.is_empty(),"Не удалось выполнить финальную проверку:\n{}",errors.join("\n"));
+    let mut message="Проверка выбранных программ завершена. Драйверы проверяйте для вашей модели компьютера на сайте производителя.".to_string();
+    if !manual.is_empty() {
+        message.push_str(&format!("\nПредупреждение. Требуют ручной установки: {}\nПроверьте сведения отдельных задач: если приложение уже установлено, подтвердите его работоспособность вручную. Ошибки установщиков сохранены в их задачах.",manual.join("; ")));
+    }
+    Ok(message)
+}
 pub fn start(
     e: Arc<Engine>,
     c: Config,
@@ -884,7 +910,7 @@ pub fn start(
                 .unwrap_or_default();
             let (status, msg) = match result {
                 Ok(s) => (
-                    if s.starts_with("Пропущено:") {
+                    if s.starts_with("Пропущено:") || s.starts_with("Уже установлена максимальная частота ") {
                         "skipped"
                     } else {
                         "succeeded"
@@ -1082,8 +1108,16 @@ mod reliability_tests {
         assert_eq!(e.state().unwrap().tasks[0].status,"succeeded");
         run.tasks[0].status="failed".into();run.tasks[0].verification_only=false;
         *e.current.lock().unwrap()=Some(run.clone());
-        assert!(check_final_programs(&e,&c,&run,|_|Ok(true)).is_err());
+        assert!(check_final_programs(&e,&c,&run,|_|Ok(true)).unwrap().contains("Требуют ручной установки:"));
         assert_eq!(e.state().unwrap().tasks[0].status,"failed");
+    }
+    #[test]
+    fn final_summary_succeeds_with_manual_items_and_fails_only_on_probe_errors() {
+        assert!(!final_check_summary(&[],&[]).unwrap().contains("Предупреждение"));
+        let manual=vec!["NVIDIA App".into(),"Armoury Crate".into()];
+        let summary=final_check_summary(&manual,&[]).unwrap();
+        assert!(summary.contains("Предупреждение. Требуют ручной установки: NVIDIA App; Armoury Crate"));
+        assert!(final_check_summary(&manual,&["Не удалось прочитать состояние системы".into()]).is_err());
     }
     #[test]
     fn final_read_error_is_not_reported_as_missing_and_retains_verification_only() {

@@ -116,7 +116,7 @@ async function repairPreparation(action) {
     await refreshPreparation();
 }
 function readiness() { return preparationPanel(preparation || inv.bootstrap) + `<div class="row item"><label>Диск данных <select id="drive"><option value="">Выберите диск</option>${(inv.disks || []).map((d) => `<option value="${d.DeviceID}" ${c.application.data_drive === d.DeviceID ? 'selected' : ''}>${d.DeviceID} — ${(d.FreeSpace / 1073741824).toFixed(1)} ГиБ свободно</option>`).join('')}</select></label><small>${esc(inv.windows)} · ${esc(inv.version)} · ${esc(inv.build)} · Git: ${inv.git ? 'доступен' : 'не найден'}</small></div>`; }
-function planTable(q) { return `<div class="warn">Предпросмотр ничего не применяет. Установки и удаления не откатываются автоматически.</div>${preparationPanel(q.readiness.bootstrap, false)}${q.warnings.map((w) => `<p class="risk">${esc(w)}</p>`).join('')}<div class="scroll"><table><thead><tr><th>Действие</th><th>Риск</th><th>Обратимость</th></tr></thead><tbody>${q.tasks.map((t) => `<tr><td>${esc(t.name)}</td><td>${badge(t.risk)}</td><td>${esc(t.reversible)}</td></tr>`).join('')}</tbody></table></div>`; }
+function planTable(q) { return `<div class="warn">Предпросмотр ничего не применяет. Установки и удаления не откатываются автоматически.</div>${preparationPanel(q.readiness.bootstrap, false)}${q.warnings.map((w) => `<p class="risk">${esc(w)}</p>`).join('')}<div class="scroll"><table><thead><tr><th>Действие</th><th>Риск</th><th>Обратимость</th></tr></thead><tbody>${q.tasks.map((t) => `<tr><td>${esc(t.name)}${t.detail ? `<p>${esc(t.detail).replace(/\n/g, '<br>')}</p>` : ''}</td><td>${badge(t.risk)}</td><td>${esc(t.reversible)}</td></tr>`).join('')}</tbody></table></div>`; }
 function taskResults() {
     if (!run)
         return '';
@@ -139,20 +139,23 @@ function profiles() { return `<div class="row">${btn('Копировать вы�
 function historyView() { return (hist.length ? btn('Откатить последний запуск', 'rollback', '', `data-id="${hist[0].id}"`) : '') + hist.map((r) => `<div class="card"><strong>${esc(r.plan.profile)}</strong><p>${esc(r.id)} · ${r.finished ? 'Завершено' : 'Есть незавершённые задачи'}</p><div class="row">${!r.finished ? btn('Проверить результаты / продолжить', 'resume', '', `data-id="${r.id}"`) : ''}${btn('Откатить настройки', 'rollback', '', `data-id="${r.id}"`)}${btn('Экспорт отчёта', 'export-report', '', `data-id="${r.id}"`)}</div><details><summary>Задачи</summary>${r.tasks.map((t) => `<p>${esc(t.name)} — ${status(t.status)}</p>`).join('')}</details></div>`).join('') || '<div class="empty">История появится после первого запуска.</div>'; }
 function settings() { return `<div class="fields"><label>Тема<select id="theme">${[['dark', 'Тёмная'], ['light', 'Светлая'], ['system', 'Системная']].map(([v, n]) => `<option value="${v}" ${c.application.theme === v ? 'selected' : ''}>${n}</option>`).join('')}</select></label><label>Повторные попытки<input type="number" id="retries" min="0" max="5" value="${c.execution.retries}"></label><label>Минимум свободного места, ГиБ<input type="number" id="min-space" min="1" value="${c.execution.minimum_free_gib}"></label></div><div class="card"><h3>Источник конфигурации</h3><input id="config-url" placeholder="https://raw.githubusercontent.com/…" style="width:100%">${btn('Загрузить и сравнить', 'remote')}<p>Изменения применяются только после показа разницы и подтверждения.</p></div><details><summary>Редактор winsetup.toml</summary><textarea id="toml" spellcheck="false">${esc(raw)}</textarea>${btn('Проверить и сохранить TOML', 'save-toml')}<p>Синтаксические ошибки указывают строку. При семантической ошибке указано начало раздела.</p></details><p>Передача паролей, токенов и произвольных команд через конфиг запрещена.</p>${btn('Вернуться к выбору режима', 'mode-choose', 'link')}`; }
 let devTests = [], dev = null, devSelected = new Set(), devExpanded = new Set(), devLevel = 'all', devHideUser = true, devPolling = false, devProfile = '';
+let acceptance = { active: false, rows: [], log: [], completed: [], manual: [] };
+let acceptanceProfile = '', acceptanceLevel = 'all', acceptanceHideUser = true, acceptancePolling = false;
+const acceptanceExpanded = new Set();
 const devNames = { PASS: 'Пройден', FAIL: 'Ошибка', WARN: 'Предупреждение', SKIP: 'Пропущен' };
 let devReal = { tests: [], pending: [], startup: [], targets: {}, data_drive: '' };
-async function refreshDev() { devTests = await api('dev_list'); dev = await api('dev_state'); devReal = await api('dev_real_info'); devProfile = c.application.selected_profile; const ids = new Set(devTests.map(t => t.id)); devSelected = new Set([...devSelected].filter(id => ids.has(id))); }
+async function refreshDev() { devTests = await api('dev_list'); dev = await api('dev_state'); devReal = await api('dev_real_info'); acceptance = await api('acceptance_state'); devProfile = c.application.selected_profile; const ids = new Set(devTests.map(t => t.id)); devSelected = new Set([...devSelected].filter(id => ids.has(id))); }
 function realPanel() {
-    const pending = devReal.pending || [], busy = !!dev?.active || !!run?.active;
+    const pending = devReal.pending || [], busy = !!dev?.active || !!run?.active || !!acceptance?.active;
     return `<section class="card"><h2>Реальные обратимые тесты</h2><p>Отдельный запуск временно отключает уведомления Telegram, советы Windows и одну выбранную запись автозапуска HKCU, затем возвращает исходные значения. На диске данных создаётся и удаляется только тестовая папка с нашим маркером.</p><p>Эта группа не входит в «Запустить все безопасные», «Запустить выбранные» и автоматическую диагностику. Снимок сохраняется до изменений и удаляется только после проверки полного возврата.</p>${pending.length ? `<div class="warn" role="alert"><strong style="font-size:1.15em">ВНИМАНИЕ: ОБНАРУЖЕНЫ СОХРАНЁННЫЕ СНИМКИ ОТКАТА</strong><p>Предыдущий возврат не подтверждён. Новые реальные тесты заблокированы.</p>${pending.map(p => `<details><summary>${esc(p.file)}${p.valid ? '' : ' — файл требует проверки'}</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(p.details)}</pre></details>`).join('')}${btn('Откатить сохранённые значения', 'dev-real-recover', '', busy ? 'disabled' : '')}</div>` : ''}<div class="row">${btn('Запустить реальные тесты', 'dev-real-run', '', busy || pending.length ? 'disabled' : '')}</div><p>Остановить можно между тестами. При тайм-ауте дальнейшее применение прекращается; возврат начатых изменений завершается и проверяется.</p></section>`;
 }
 function devView() {
-    const active = !!dev?.active, results = dev?.results || [], log = dev?.log || [];
+    const active = !!dev?.active || !!acceptance?.active, results = dev?.results || [], log = dev?.log || [];
     const visible = [...devTests, ...(devReal.tests || [])];
     for (const t of dev?.tests || [])
         if (!visible.some(v => v.id === t.id))
             visible.push(t);
-    return `<h2>Безопасные тесты</h2><p>Без установки программ и изменений Windows. Vault и файловые проверки работают во временной папке. Для сетевых проверок используются только winget show и git ls-remote.</p><div class="row">${btn('Запустить все безопасные', 'dev-all', 'primary', active ? 'disabled' : '')}${btn('Запустить выбранные', 'dev-selected', '', active || !devSelected.size ? 'disabled' : '')}${btn('Остановить', 'dev-stop', '', !active || dev?.stopping ? 'disabled' : '')}${btn('Копировать отчёт', 'dev-copy', '', !dev?.id ? 'disabled' : '')}${btn('Сохранить отчёт', 'dev-save', '', active || !dev?.id ? 'disabled' : '')}${btn('Открыть папку логов', 'dev-open')}</div><p><label><input type="checkbox" id="dev-hide-user" ${devHideUser ? 'checked' : ''}> Скрыть имя пользователя при копировании</label></p>${realPanel()}<p aria-live="polite">${active ? (dev?.stopping ? 'Остановка после текущего теста и возврата изменений…' : `Выполняется: ${esc(visible.find(t => t.id === dev?.current)?.name || 'Подготовка')}`) : dev?.id ? 'Диагностика завершена' : 'Выберите тесты или запустите все безопасные'}</p><div class="row">${Object.entries(devNames).map(([code, name]) => `<span class="badge" title="${name}">${code}: ${results.filter(r => r.status === code).length}</span>`).join('')}</div>${dev?.error ? `<div class="warn" role="alert">${esc(dev.error)}</div>` : ''}${dev?.report_path ? `<p>Отчёт: ${esc(dev.report_path)}</p>` : ''}<div class="scroll"><table><thead><tr><th><input type="checkbox" id="dev-select-all" aria-label="Выбрать все безопасные тесты" ${devTests.length && devTests.every(t => devSelected.has(t.id)) ? 'checked' : ''} ${active ? 'disabled' : ''}></th><th>Группа</th><th>Название и технический вывод</th><th>Статус</th><th>Время</th><th>Краткий результат</th></tr></thead><tbody>${visible.map(t => { const r = results.find(r => r.id === t.id); return `<tr><td>${t.group === 10 ? 'Отдельный запуск' : `<input type="checkbox" data-dev-test="${esc(t.id)}" aria-label="${esc(t.name)}" ${devSelected.has(t.id) ? 'checked' : ''} ${active ? 'disabled' : ''}>`}</td><td>${t.group === 10 ? 'Реальные обратимые тесты' : t.group}</td><td><details data-dev-detail="${esc(t.id)}" ${devExpanded.has(t.id) ? 'open' : ''}><summary>${esc(t.name)}</summary>${r?.summary?.includes('ВНИМАНИЕ') ? `<p class="warn" role="alert"><strong style="font-size:1.15em">${esc(r.summary)}</strong></p>` : ''}<pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(r?.technical || 'Технический вывод появится после проверки')}</pre></details></td><td>${r ? `${r.status} — ${devNames[r.status]}` : dev?.current === t.id ? 'Выполняется' : 'Ожидает'}</td><td>${r ? (r.elapsed_ms / 1000).toFixed(2) + ' с' : '—'}</td><td>${esc(r?.summary || '')}</td></tr>`; }).join('')}</tbody></table></div><h2>Живой журнал</h2><label>Уровень <select id="dev-level"><option value="all">Все</option>${Object.entries(devNames).map(([code, name]) => `<option value="${code}" ${devLevel === code ? 'selected' : ''}>${name} (${code})</option>`).join('')}</select></label><pre id="dev-log" style="max-height:320px;overflow:auto;white-space:pre-wrap">${esc(log.filter(l => devLevel === 'all' || l.level === devLevel).map(l => `${l.time} [${l.level}] ${l.message}`).join('\n'))}</pre><p>Отчёты сохраняются в папку logs рядом с приложением; остаются последние пять запусков. Снимки незавершённого отката из ротации исключены.</p>`;
+    return `<h2>Безопасные тесты</h2><p>Без установки программ и изменений Windows. Vault и файловые проверки работают во временной папке. Для сетевых проверок используются только winget show и git ls-remote.</p><div class="row">${btn('Запустить все безопасные', 'dev-all', 'primary', active ? 'disabled' : '')}${btn('Запустить выбранные', 'dev-selected', '', active || !devSelected.size ? 'disabled' : '')}${btn('Остановить', 'dev-stop', '', !active || dev?.stopping ? 'disabled' : '')}${btn('Копировать отчёт', 'dev-copy', '', !dev?.id ? 'disabled' : '')}${btn('Сохранить отчёт', 'dev-save', '', active || !dev?.id ? 'disabled' : '')}${btn('Открыть папку логов', 'dev-open')}</div><p><label><input type="checkbox" id="dev-hide-user" ${devHideUser ? 'checked' : ''}> Скрыть имя пользователя при копировании</label></p>${realPanel()}${acceptancePanel()}<p aria-live="polite">${active ? (dev?.stopping ? 'Остановка после текущего теста и возврата изменений…' : `Выполняется: ${esc(visible.find(t => t.id === dev?.current)?.name || 'Подготовка')}`) : dev?.id ? 'Диагностика завершена' : 'Выберите тесты или запустите все безопасные'}</p><div class="row">${Object.entries(devNames).map(([code, name]) => `<span class="badge" title="${name}">${code}: ${results.filter(r => r.status === code).length}</span>`).join('')}</div>${dev?.error ? `<div class="warn" role="alert">${esc(dev.error)}</div>` : ''}${dev?.report_path ? `<p>Отчёт: ${esc(dev.report_path)}</p>` : ''}<div class="scroll"><table><thead><tr><th><input type="checkbox" id="dev-select-all" aria-label="Выбрать все безопасные тесты" ${devTests.length && devTests.every(t => devSelected.has(t.id)) ? 'checked' : ''} ${active ? 'disabled' : ''}></th><th>Группа</th><th>Название и технический вывод</th><th>Статус</th><th>Время</th><th>Краткий результат</th></tr></thead><tbody>${visible.map(t => { const r = results.find(r => r.id === t.id); return `<tr><td>${t.group === 10 ? 'Отдельный запуск' : `<input type="checkbox" data-dev-test="${esc(t.id)}" aria-label="${esc(t.name)}" ${devSelected.has(t.id) ? 'checked' : ''} ${active ? 'disabled' : ''}>`}</td><td>${t.group === 10 ? 'Реальные обратимые тесты' : t.group}</td><td><details data-dev-detail="${esc(t.id)}" ${devExpanded.has(t.id) ? 'open' : ''}><summary>${esc(t.name)}</summary>${r?.summary?.includes('ВНИМАНИЕ') ? `<p class="warn" role="alert"><strong style="font-size:1.15em">${esc(r.summary)}</strong></p>` : ''}<pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(r?.technical || 'Технический вывод появится после проверки')}</pre></details></td><td>${r ? `${r.status} — ${devNames[r.status]}` : dev?.current === t.id ? 'Выполняется' : 'Ожидает'}</td><td>${r ? (r.elapsed_ms / 1000).toFixed(2) + ' с' : '—'}</td><td>${esc(r?.summary || '')}</td></tr>`; }).join('')}</tbody></table></div><h2>Живой журнал</h2><label>Уровень <select id="dev-level"><option value="all">Все</option>${Object.entries(devNames).map(([code, name]) => `<option value="${code}" ${devLevel === code ? 'selected' : ''}>${name} (${code})</option>`).join('')}</select></label><pre id="dev-log" style="max-height:320px;overflow:auto;white-space:pre-wrap">${esc(log.filter(l => devLevel === 'all' || l.level === devLevel).map(l => `${l.time} [${l.level}] ${l.message}`).join('\n'))}</pre><p>Отчёты сохраняются в папку logs рядом с приложением; остаются последние пять запусков. Снимки незавершённого отката из ротации исключены.</p>`;
 }
 async function runRealDialog() {
     if (dirty) {
@@ -198,6 +201,10 @@ function renderDev() { const host = document.querySelector('#dev-tests'); if (ho
         select.value = devLevel;
 } }
 async function devAction(action) {
+    if (action.startsWith('dev-acceptance-')) {
+        await acceptanceAction(action);
+        return;
+    }
     if (action === 'dev-real-run') {
         await runRealDialog();
         return;
@@ -750,4 +757,109 @@ catch (e) {
     catch { }
     app.innerHTML = `<main><h1>Подготовка среды</h1><pre>${esc(e)}</pre>${preparationPanel(preparation)}<p>Если существующий конфиг повреждён, исправьте его вручную; программа его не заменяет.</p></main>`;
 }
+function acceptancePanel() {
+    const selected = acceptanceProfile || ((c.profiles || []).some((p) => p.name === 'Мой ПК') ? 'Мой ПК' : c.application.selected_profile);
+    const busy = !!acceptance.active || !!dev?.active || !!run?.active;
+    const rows = acceptance.rows || [], journal = acceptance.log || [];
+    return `<section class="card" id="acceptance-panel"><h2>Приёмка чистой Windows</h2><p>Два обычных запуска профиля, независимая сверка результата и откат настроек первого запуска. Установки и удаления Appx не откатываются. Эта группа запускается только отдельно.</p><label>Профиль<select id="acceptance-profile" ${busy ? 'disabled' : ''}>${c.profiles.map((p) => `<option value="${esc(p.name)}" ${p.name === selected ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label><div class="row">${btn('Запустить приёмку', 'dev-acceptance-start', '', 'style="background:#b4232c;color:white;border-color:#b4232c" ' + (busy ? 'disabled' : ''))}${btn('Остановить', 'dev-acceptance-stop', '', !acceptance.active || acceptance.stopping ? 'disabled' : '')}${btn('Копировать отчёт', 'dev-acceptance-copy', '', !acceptance.id ? 'disabled' : '')}${btn('Сохранить отчёт', 'dev-acceptance-save', '', !acceptance.id || acceptance.active ? 'disabled' : '')}${btn('Открыть папку логов', 'dev-acceptance-open')}</div><label><input id="acceptance-hide-user" type="checkbox" ${acceptanceHideUser ? 'checked' : ''}> Скрыть имя пользователя при копировании</label><p aria-live="polite">${acceptance.active ? (acceptance.stopping ? 'Остановка после текущего шага. Откат не запускается автоматически после остановки.' : `Выполняется шаг ${esc(acceptance.step || 'A')}`) : acceptance.id ? 'Приёмка завершена — смотрите все статусы ниже' : 'Приёмка ещё не запускалась'}</p><div class="row">${['A', 'B', 'C', 'D', 'E', 'F'].map(step => `<span class="badge">${step}: ${(acceptance.completed || []).includes(step) ? 'завершён' : acceptance.active && acceptance.step === step ? 'выполняется' : 'не завершён'}</span>`).join('')}</div><p>Лимит каждого прогона — 45 минут до запроса отмены. Работающий установщик завершается штатно; до этого следующие шаги и другие изменения заблокированы.</p>${acceptance.dirty?.length ? `<div role="alert" style="border:2px solid #db4652;padding:16px"><strong style="font-size:1.3em;color:#ff6b78">НЕЧИСТАЯ СИСТЕМА</strong><pre>${esc(acceptance.dirty.join('\n'))}</pre></div>` : ''}${acceptance.error ? `<div class="warn" role="alert">${esc(acceptance.error)}</div>` : ''}${rows.filter(r => r.discrepancy).map(r => `<p role="alert" style="background:#8a1823;color:white;padding:16px;font-size:1.2em"><strong>FAIL — РАСХОЖДЕНИЕ: ${esc(r.check)}</strong><br>${esc(r.fact)}</p>`).join('')}<div class="row">${Object.keys(devNames).map(code => `<span class="badge">${code}: ${rows.filter(r => r.status === code).length}</span>`).join('')}</div><div class="scroll"><table><thead><tr><th>Проверка</th><th>Ожидание</th><th>Факт / подробности</th><th>Статус</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${esc(r.step)} · ${esc(r.check)}</td><td>${esc(r.expected)}</td><td>${esc(r.fact)}<details data-acceptance-detail="${i}" ${acceptanceExpanded.has(String(i)) ? 'open' : ''}><summary>Подробности и источник признака</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(r.detail)}</pre></details></td><td>${esc(r.status)}</td></tr>`).join('')}</tbody></table></div><h3>Требуют ручной установки или проверки</h3><p>${esc((acceptance.manual || []).join('; ') || 'Нет')}</p>${acceptance.first ? `<p>Первый прогон для отката в Истории: <code>${esc(acceptance.first.id)}</code></p>` : ''}<label>Фильтр журнала<select id="acceptance-level"><option value="all">Все</option>${Object.entries(devNames).map(([code, name]) => `<option value="${code}" ${acceptanceLevel === code ? 'selected' : ''}>${name}</option>`).join('')}</select></label><pre style="max-height:320px;overflow:auto;white-space:pre-wrap">${esc(journal.filter(l => acceptanceLevel === 'all' || l.level === acceptanceLevel).map(l => `${l.time} [${l.level}] ${l.message}`).join('\n'))}</pre>${acceptance.report_path ? `<p>Отчёт: ${esc(acceptance.report_path)}</p>` : ''}</section>`;
+}
+function renderAcceptance() { const panel = document.querySelector('#acceptance-panel'); if (panel)
+    panel.outerHTML = acceptancePanel(); }
+function acceptanceConfirmationAllowed(word, isVM, realAck, needsWinget, wingetAck, needsPassword, password) {
+    return word === 'ПРИЁМКА' && (isVM || realAck) && (!needsWinget || wingetAck) && (!needsPassword || password.length > 0);
+}
+async function acceptanceAction(action) {
+    if (action === 'dev-acceptance-start') {
+        if (dirty) {
+            toast('Сначала сохраните или перечитайте конфиг. Приёмка не сохраняет winsetup.toml автоматически.');
+            return;
+        }
+        const select = document.querySelector('#acceptance-profile');
+        acceptanceProfile = select.value;
+        const prepared = await api('acceptance_prepare', { profile: acceptanceProfile });
+        const tasks = prepared.plan.tasks;
+        const count = (kind) => tasks.filter(t => t.action.kind === kind).length;
+        const isVM = prepared.host.is_vm === true;
+        const body = `<div role="alert" style="border:2px solid #db4652;padding:16px"><strong>Будут реальные изменения. Установки программ и удаление Appx НЕ откатываются.</strong><p>Дважды будет запущен профиль «${esc(acceptanceProfile)}», затем выполнен ограниченный откат первого запуска.</p></div>${!isVM ? '<div role="alert" style="background:#8a1823;color:white;padding:20px;font-size:1.4em"><strong>Это реальный компьютер</strong></div><label><input id="acceptance-real" type="checkbox"> Я понимаю, что это реальный компьютер</label>' : '<p>Обнаружена виртуальная машина</p>'}<p>${esc(prepared.host.manufacturer)} · ${esc(prepared.host.model)}</p><ul><li>Программ к установке: ${count('Program')}</li><li>Appx к удалению: ${count('Remove')}</li><li>Твиков: ${count('Tweak')}</li><li>Папок: ${count('Folder')}</li></ul><details><summary>Полный план изменений</summary><pre style="white-space:pre-wrap">${esc(tasks.map(t => t.name).join('\n'))}</pre></details><p>Папки, репозитории и восстановленные файлы ограниченный откат также не удаляет. Нечистая система не останавливает приёмку.</p><label><input id="acceptance-no-point" type="checkbox" checked> Если точку восстановления создать не удастся, продолжить без неё</label>${prepared.needs_winget ? '<label><input id="acceptance-winget" type="checkbox"> Разрешаю обычную подготовку winget: скачивание и установку официальных пакетов Microsoft</label>' : ''}${prepared.needs_password ? '<label>Пароль Vault<input id="acceptance-password" type="password" autocomplete="off"></label>' : ''}<label>Введите точно слово ПРИЁМКА<input id="acceptance-word" autocomplete="off" spellcheck="false"></label><p>Остановка действует между шагами A–F. Лимит прогона 45 минут запрашивает отмену между задачами, но не прерывает работающий установщик.</p>`;
+        const waiting = modal('Подтверждение приёмки', body, 'Запустить приёмку');
+        const word = dlg.querySelector('#acceptance-word'), yes = dlg.querySelector('#yes');
+        const real = dlg.querySelector('#acceptance-real'), winget = dlg.querySelector('#acceptance-winget'), pass = dlg.querySelector('#acceptance-password');
+        const gate = () => { yes.disabled = !acceptanceConfirmationAllowed(word.value, isVM, !!real?.checked, !!winget, !!winget?.checked, !!pass, pass?.value || ''); };
+        yes.style.background = '#b4232c';
+        gate();
+        dlg.addEventListener('input', gate);
+        dlg.addEventListener('change', gate);
+        const confirmed = await waiting;
+        dlg.removeEventListener('input', gate);
+        dlg.removeEventListener('change', gate);
+        if (!confirmed || yes.disabled) {
+            if (pass)
+                pass.value = '';
+            return;
+        }
+        const payload = { token: prepared.token, word: word.value, real_ack: !!real?.checked, no_point_ok: dlg.querySelector('#acceptance-no-point').checked, winget_consent: !!winget?.checked, password: pass?.value || '' };
+        if (pass)
+            pass.value = '';
+        try {
+            acceptance = await api('acceptance_start', payload);
+            acceptanceExpanded.clear();
+            renderDev();
+        }
+        finally {
+            payload.password = '';
+        }
+    }
+    else if (action === 'dev-acceptance-stop') {
+        acceptance = await api('acceptance_stop');
+        renderAcceptance();
+    }
+    else if (action === 'dev-acceptance-copy') {
+        await navigator.clipboard.writeText(await api('acceptance_state', { action: 'report', hide_user: acceptanceHideUser }));
+        toast('Отчёт приёмки скопирован');
+    }
+    else if (action === 'dev-acceptance-save') {
+        toast('Отчёт сохранён: ' + await api('acceptance_state', { action: 'save' }));
+    }
+    else if (action === 'dev-acceptance-open') {
+        await api('acceptance_state', { action: 'open_logs' });
+    }
+}
+document.addEventListener('change', ev => {
+    const el = ev.target;
+    if (el.id === 'acceptance-profile')
+        acceptanceProfile = el.value;
+    if (el.id === 'acceptance-hide-user')
+        acceptanceHideUser = el.checked;
+    if (el.id === 'acceptance-level') {
+        acceptanceLevel = el.value;
+        renderAcceptance();
+    }
+});
+document.addEventListener('toggle', ev => { const el = ev.target; const key = el.dataset.acceptanceDetail; if (key === undefined)
+    return; if (el.open)
+    acceptanceExpanded.add(key);
+else
+    acceptanceExpanded.delete(key); }, true);
+setInterval(async () => {
+    if (acceptancePolling || !c || (!c.application.dev_mode && !acceptance.active))
+        return;
+    acceptancePolling = true;
+    try {
+        const next = await api('acceptance_state');
+        if (JSON.stringify(next) !== JSON.stringify(acceptance)) {
+            const transition = !!next.active !== !!acceptance.active;
+            acceptance = next;
+            if (transition)
+                renderDev();
+            else
+                renderAcceptance();
+        }
+    }
+    catch (e) {
+        toast(e);
+    }
+    finally {
+        acceptancePolling = false;
+    }
+}, 1000);
 export {};

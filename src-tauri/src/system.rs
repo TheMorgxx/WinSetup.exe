@@ -143,13 +143,32 @@ fn registry_matches(p: &crate::model::Program, app: &Value) -> bool {
     };
     names.iter().any(|n|name.eq_ignore_ascii_case(n)) && publishers.contains(&publisher.as_str())
 }
-fn winget_list_matches(output: &str, p: &crate::model::Program) -> bool {
-    output.lines().any(|line| {
+fn winget_list_evidence(output: &str, p: &crate::model::Program) -> Option<String> {
+    let mut table=false;
+    for line in output.lines() {
+        let line=line.trim();
+        if line.len()>=3 && line.chars().all(|c|c=='-') { table=true;continue; }
+        if !table { continue; }
         let fields=line.split_whitespace().collect::<Vec<_>>();
-        fields.iter().position(|v|v.eq_ignore_ascii_case(&p.id)).map(|index|
-            index>0 && fields.get(index+1).map(|version| p.version.is_empty() || *version==p.version).unwrap_or(false)
-        ).unwrap_or(false)
-    })
+        if !fields.last().map(|s|s.eq_ignore_ascii_case(&p.source)).unwrap_or(false) {continue;}
+        for index in 1..fields.len() {
+            // После Id идут Version, необязательная Available и Source.
+            let tail=fields.len()-index;
+            if ![3,4].contains(&tail) || !fields[index].eq_ignore_ascii_case(&p.id) {continue;}
+            let version=fields[index+1];
+            let version_like=|v:&str|v.chars().next().map(|c|c.is_ascii_digit()).unwrap_or(false)
+                || v.eq_ignore_ascii_case("Unknown") || v.eq_ignore_ascii_case("Неизвестно");
+            if !version_like(version) || (tail==4 && !version_like(fields[index+2])) {continue;}
+            if !p.version.is_empty() && version!=p.version {continue;}
+            return Some(format!("winget list --id {} --exact --source {}: найдено; имя: {}; версия: {}",
+                p.id,p.source,fields[..index].join(" "),version));
+        }
+    }
+    None
+}
+#[cfg(test)]
+fn winget_list_matches(output: &str, p: &crate::model::Program) -> bool {
+    winget_list_evidence(output,p).is_some()
 }
 fn latest_discord_app(root: &std::path::Path) -> Option<PathBuf> {
     std::fs::read_dir(root).ok()?.filter_map(|e|e.ok()).filter_map(|e|{
@@ -182,6 +201,15 @@ fn vencord_at(discord: &std::path::Path, data: &std::path::Path) -> Result<bool>
     Ok(false)
 }
 pub fn installed(p: &crate::model::Program) -> Result<bool> {
+    installed_check(p,&mut None)
+}
+pub fn installed_evidence(p: &crate::model::Program) -> Result<Option<String>> {
+    let mut evidence=None;
+    if installed_check(p,&mut evidence)? {
+        Ok(Some(evidence.unwrap_or_else(||"Проверка Vencord: подтверждён загрузчик модификации в текущей версии Discord и файл patcher.js".into())))
+    } else { Ok(None) }
+}
+fn installed_check(p: &crate::model::Program, evidence: &mut Option<String>) -> Result<bool> {
     if p.source=="git" {return Ok(false);}
     if p.source=="winget" && p.id=="Vendicated.Vencord" {
         ensure!(p.version.is_empty(),"Версия установщика Vencord не подтверждает версию модификации Discord; автоматическая проверка закреплённой версии недоступна");
@@ -199,7 +227,13 @@ $apps=@(foreach($root in $roots){if(Test-Path -LiteralPath $root){Get-ItemProper
 ConvertTo-Json -InputObject $apps -Depth 3
 "#,&json!({}));
         match apps {
-            Ok(apps) => {if array(apps).iter().any(|a|registry_matches(p,a)){return Ok(true);}},
+            Ok(apps) => {if let Some(app)=array(apps).iter().find(|a|registry_matches(p,a)){
+                *evidence=Some(format!("Uninstall: {}; издатель: {}; версия: {}; точное совпадение {}",
+                    app["name"].as_str().unwrap_or(""),app["publisher"].as_str().filter(|s|!s.is_empty()).unwrap_or("не указан"),
+                    app["version"].as_str().filter(|s|!s.is_empty()).unwrap_or("не указана"),
+                    if p.source=="direct" {"detect_name"} else {"имени и разрешённого издателя"}));
+                return Ok(true);
+            }},
             Err(e) => registry_error=Some(e),
         }
         if p.source=="direct" {return match registry_error {Some(e)=>Err(e),None=>Ok(false)};}
@@ -207,16 +241,20 @@ ConvertTo-Json -InputObject $apps -Depth 3
     let args=vec!["list".into(),"--id".into(),p.id.clone(),"--exact".into(),"--source".into(),p.source.clone(),
         "--accept-source-agreements".into(),"--disable-interactivity".into()];
     let (ok,code,out,err)=raw_command("winget.exe",&args,Some(Duration::from_secs(20)))?;
-    if ok {let mut any_version=p.clone();any_version.version.clear();if winget_list_matches(&out,&any_version){return Ok(winget_list_matches(&out,p));}}
+    if ok {
+        *evidence=winget_list_evidence(&out,p);
+        if evidence.is_some() {return Ok(true);}
+        let mut any_version=p.clone();any_version.version.clear();
+        if winget_list_evidence(&out,&any_version).is_some() {return Ok(false);}
+    }
     // APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND: absence, not a failed system probe.
     if code.map(|c|c as u32)==Some(0x8A150014) {
         return match registry_error {Some(e)=>Err(e),None=>Ok(false)};
     }
     ensure!(ok,"Не удалось проверить {} через winget list (код {:?}): {}",p.name,code,compact_output(&format!("{out}\n{err}")));
     if let Some(e)=registry_error {return Err(e);}
-    ensure!(winget_list_matches(&out,p),"winget list завершился, но однозначное совпадение {}{} не подтверждено. {}",p.id,
-        if p.version.is_empty(){String::new()}else{format!(" версии {}",p.version)},compact_output(&out));
-    Ok(true)
+    // Частичное совпадение или нераспознанная строка не доказывают установку.
+    Ok(false)
 }
 pub fn remove_app(name: &str) -> Result<String> {
     ensure!(crate::model::removable(name), "Защищённый пакет");
@@ -578,6 +616,28 @@ pub struct Display {
     pub maximum: u32,
     pub available: Vec<u32>,
 }
+#[derive(Debug, PartialEq)]
+pub enum RefreshDecision {
+    Skip(u32),
+    Apply(u32),
+}
+impl RefreshDecision {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Skip(hz) => format!("Уже установлена максимальная частота {hz} Гц"),
+            Self::Apply(hz) => format!("Установить максимальную частоту {hz} Гц"),
+        }
+    }
+}
+pub fn refresh_decision(d: &Display) -> Result<RefreshDecision> {
+    ensure!(d.width > 0 && d.height > 0 && d.bits > 0 && d.current > 1,
+        "Не удалось определить текущий режим дисплея");
+    ensure!(d.maximum >= d.current && (d.maximum == d.current || d.available.contains(&d.maximum)),
+        "Максимальный режим больше не доступен: перечитайте список режимов");
+    // current и available относятся к одним разрешению, глубине цвета и флагам.
+    Ok(if d.current == d.maximum { RefreshDecision::Skip(d.current) }
+       else { RefreshDecision::Apply(d.maximum) })
+}
 pub fn displays() -> Vec<Display> {
     let mut out = vec![];
     for i in 0..32 {
@@ -607,6 +667,7 @@ pub fn displays() -> Vec<Display> {
                     break;
                 }
             }
+            if cur.hz > 1 { hz.push(cur.hz); }
             hz.sort();
             hz.dedup();
             out.push(Display {
@@ -623,54 +684,43 @@ pub fn displays() -> Vec<Display> {
     out
 }
 pub fn set_display(d: &Display, hz: u32) -> Result<()> {
-    let mut chosen = None;
-    for j in 0..10000 {
-        if let Some(m) = mode(&d.device, j) {
-            if m.width == d.width && m.height == d.height && m.bits == d.bits && m.hz == hz {
-                chosen = Some(m);
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    let mut m = chosen.context("Режим больше не доступен")?;
-    let cur = mode(&d.device, u32::MAX).context("Монитор недоступен")?;
-    ensure!(
-        cur.width == d.width && cur.height == d.height && cur.bits == d.bits,
-        "Разрешение изменилось: пересоздайте план"
-    );
-    m.fields |= 0x400000;
     let n = wide(&d.device);
-    ensure!(
-        unsafe {
-            ChangeDisplaySettingsExW(
-                n.as_ptr(),
-                &mut m,
-                std::ptr::null_mut(),
-                2,
-                std::ptr::null_mut(),
-            )
-        } == 0,
-        "CDS_TEST: режим не поддерживается"
-    );
-    ensure!(
-        unsafe {
-            ChangeDisplaySettingsExW(
-                n.as_ptr(),
-                &mut m,
-                std::ptr::null_mut(),
-                1,
-                std::ptr::null_mut(),
-            )
-        } == 0,
-        "Не удалось применить частоту"
-    );
-    ensure!(
-        mode(&d.device, u32::MAX).map(|m| m.hz) == Some(hz),
-        "Постпроверка частоты не прошла"
-    );
-    Ok(())
+    for attempt in 0..2 {
+        let cur = mode(&d.device, u32::MAX).context("Монитор недоступен")?;
+        ensure!(cur.width == d.width && cur.height == d.height && cur.bits == d.bits,
+            "Разрешение или глубина цвета изменились: пересоздайте план");
+        if cur.hz == hz { return Ok(()); }
+        let mut chosen = None;
+        // Индекс 0 заново запрашивает список режимов, в том числе при повторной попытке.
+        for j in 0..10000 {
+            if let Some(m) = mode(&d.device, j) {
+                if m.width == d.width && m.height == d.height && m.bits == d.bits
+                    && m.flags == cur.flags && m.hz == hz {
+                    chosen = Some(m);
+                    break;
+                }
+            } else { break; }
+        }
+        let mut m = match chosen {
+            Some(m) => m,
+            None if attempt == 0 => continue,
+            None => anyhow::bail!("Режим больше не доступен после повторного чтения списка"),
+        };
+        m.fields |= 0x400000;
+        let tested = unsafe { ChangeDisplaySettingsExW(n.as_ptr(), &mut m,
+            std::ptr::null_mut(), 2, std::ptr::null_mut()) };
+        if tested != 0 && attempt == 0 { continue; }
+        ensure!(tested == 0, "CDS_TEST: режим не поддерживается после повторного чтения (код {tested})");
+        let applied = unsafe { ChangeDisplaySettingsExW(n.as_ptr(), &mut m,
+            std::ptr::null_mut(), 1, std::ptr::null_mut()) };
+        if applied == -2 && attempt == 0 { continue; } // DISP_CHANGE_BADMODE
+        ensure!(applied == 0, "Не удалось применить частоту (код {applied})");
+        let actual = mode(&d.device, u32::MAX).context("Монитор недоступен при постпроверке")?;
+        ensure!(actual.hz == hz && actual.width == d.width && actual.height == d.height && actual.bits == d.bits,
+            "Постпроверка режима дисплея не прошла");
+        return Ok(());
+    }
+    anyhow::bail!("Режим больше не доступен после повторного чтения списка")
 }
 pub fn internet() -> bool {
     use std::net::{TcpStream, ToSocketAddrs};
@@ -736,6 +786,21 @@ mod restore_point_tests {
 #[cfg(test)]
 mod reliability_tests {
     use super::*;
+    #[test]
+    fn maximum_refresh_decides_skip_apply_or_error_without_system_calls() {
+        let mut d=Display{device:"test".into(),width:1920,height:1080,bits:32,
+            current:144,maximum:144,available:vec![60,144]};
+        assert_eq!(refresh_decision(&d).unwrap(),RefreshDecision::Skip(144));
+        assert_eq!(refresh_decision(&d).unwrap().message(),"Уже установлена максимальная частота 144 Гц");
+        d.current=60;
+        assert_eq!(refresh_decision(&d).unwrap(),RefreshDecision::Apply(144));
+        d.available=vec![60];
+        assert!(refresh_decision(&d).is_err());
+        d.current=64;d.maximum=64;d.available.clear();
+        assert_eq!(refresh_decision(&d).unwrap(),RefreshDecision::Skip(64));
+        d.bits=0;
+        assert!(refresh_decision(&d).is_err());
+    }
     fn program(id:&str)->crate::model::Program {crate::model::defaults().programs.into_iter().find(|p|p.id==id).unwrap()}
     #[test]
     fn registry_requires_exact_application_publisher_and_version() {
@@ -753,12 +818,26 @@ mod reliability_tests {
     #[test]
     fn winget_identity_and_version_are_not_substring_matches() {
         let mut p=program("Discord.Discord");
+        let winget_list_matches=|row:&str,p:&crate::model::Program|
+            super::winget_list_matches(&format!("Name Id Version Source\n----------------------------------------\n{row}"),p);
         assert!(winget_list_matches("Discord  Discord.Discord  1.0.9262  winget",&p));
         assert!(!winget_list_matches("Discord Canary  Discord.Discord.Canary  1.0.9262 winget",&p));
         assert!(!winget_list_matches("Name Id Version Source\n-------------------",&p));
         p.version="1.0.9262".into();
         assert!(winget_list_matches("Discord  Discord.Discord  1.0.9262 winget",&p));
         assert!(!winget_list_matches("Discord  Discord.Discord  1.0.92620 winget",&p));
+        let git=program("Git.Git");
+        assert!(winget_list_matches("Git Git.Git 2.47.1 winget",&git));
+        assert!(winget_list_matches("Git Git.Git 2.47.1 2.48.0 winget",&git));
+        assert!(!winget_list_matches("Git GUI Git.Git.GUI 2.47.1 winget",&git));
+        assert!(!winget_list_matches("GitHub Desktop GitHub.GitHubDesktop 3.0 winget",&git));
+        assert!(!winget_list_matches("Git.Git Unrelated.Package 1.0 winget",&git));
+        assert!(!winget_list_matches("Git Git.Git 2.47.1 msstore",&git));
+        assert!(!super::winget_list_matches("Диагностика: Git.Git найдено",&git));
+        assert!(!super::winget_list_matches("Git Git.Git 2.47.1 winget",&git));
+        let evidence=winget_list_evidence("Name Id Version Source\n----------------------------------------\nGit Git.Git 2.47.1 winget",&git).unwrap();
+        assert!(evidence.contains("winget list --id Git.Git --exact --source winget: найдено"));
+        assert!(evidence.contains("версия: 2.47.1"));
     }
     #[test]
     fn compact_log_preserves_unicode_and_final_installer_error() {

@@ -11,6 +11,8 @@ use winsetup::{bootstrap, devtest, engine, model, storage, system, vault};
 #[derive(Clone)]
 struct AppState {
     dev: Arc<devtest::Runner>,
+    acceptance: Arc<devtest::acceptance::Acceptance>,
+    operation_gate: Arc<Mutex<()>>,
     engine: Arc<engine::Engine>,
     plan: Arc<Mutex<Option<engine::Plan>>>,
     remote: Arc<Mutex<Option<(String, String)>>>,
@@ -88,7 +90,13 @@ fn dispatch(
     window: tauri::WebviewWindow,
 ) -> Result<Value> {
     let e = state.engine.clone();
-    if state.dev.state().active && !["get", "state", "dev_list", "dev_run", "dev_stop", "dev_state", "dev_real_info"].contains(&op) {
+    let readonly=["get","state","dev_list","dev_state","dev_real_info","acceptance_state","acceptance_stop","bootstrap_status"].contains(&op)
+        && payload["action"]!="save";
+    let _operation=if readonly {None}else{Some(state.operation_gate.lock().unwrap())};
+    if state.acceptance.active() && !readonly {
+        anyhow::bail!("Дождитесь завершения приёмки или остановите её между шагами");
+    }
+    if state.dev.state().active && !["get", "state", "dev_list", "dev_run", "dev_stop", "dev_state", "dev_real_info", "acceptance_state", "acceptance_stop"].contains(&op) {
         anyhow::bail!("Дождитесь завершения диагностики или остановите её");
     }
     match op {
@@ -108,6 +116,25 @@ fn dispatch(
             e.busy.store(false,Ordering::SeqCst);
             Ok(json!(result?))
         }
+        "acceptance_prepare" => {
+            ensure!(!state.dev.state().active,"Дождитесь завершения диагностики");
+            state.acceptance.prepare(&e,text(&payload,"profile")?)
+        }
+        "acceptance_start" => {
+            ensure!(!state.dev.state().active,"Дождитесь завершения диагностики");
+            state.acceptance.start(e.clone(),&payload)?;
+            Ok(json!(state.acceptance.state()))
+        }
+        "acceptance_stop" => {state.acceptance.stop();Ok(json!(state.acceptance.state()))}
+        "acceptance_state" => match payload["action"].as_str() {
+            Some("save") => {ensure!(!state.acceptance.active(),"Дождитесь окончания приёмки");Ok(json!(state.acceptance.save(&e.root)?))}
+            Some("report") => {
+                let report=devtest::acceptance::report(&state.acceptance.state());
+                Ok(json!(if payload["hide_user"]==true{devtest::hide_user(&report)}else{report}))
+            }
+            Some("open_logs") => {devtest::open_logs(&e.root)?;Ok(Value::Null)}
+            _ => Ok(json!(state.acceptance.state())),
+        },
         "dev_list" => Ok(json!(devtest::list(&e.root))),
         "dev_real_info" => Ok(devtest::real_info(&e.root, payload["startup"] == true)?),
         "dev_real_run" => {
@@ -456,6 +483,8 @@ fn main() {
             engine.bootstrap.initialize(&engine.root);
             app.manage(AppState {
                 dev: Arc::new(devtest::Runner::default()),
+                acceptance: Arc::new(devtest::acceptance::Acceptance::default()),
+                operation_gate: Arc::new(Mutex::new(())),
                 engine,
                 plan: Arc::new(Mutex::new(None)),
                 remote: Arc::new(Mutex::new(None)),
