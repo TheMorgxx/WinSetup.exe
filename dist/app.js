@@ -1,18 +1,19 @@
 let c, hash = '', raw = '', inv = {}, plan = null, run = null, hist = [], page = 'Главная', tab = 'Программы', dirty = false, mode = 'choose', query = '', firstPlan = true, loading = false, external = false, autoFlagUsed = false;
 const app = document.querySelector('#app'), dlg = document.querySelector('#dialog');
 const api = (op, payload = {}) => window.__TAURI__.core.invoke('api', { op, payload });
+let preparation = null, bootstrapBusy = false, bootstrapHintShown = false, configCreated = false;
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const btn = (label, action, cls = '', extra = '') => `<button data-action="${action}" class="${cls}" ${extra}>${label}</button>`;
 const badge = (risk = 'Безопасно') => `<span class="badge ${risk === 'Высокий риск' ? 'high' : risk === 'Осторожно' ? 'risk' : ''}">${esc(risk)}</span>`;
 const p = () => c.profiles.find((p) => p.name === c.application.selected_profile);
 const sel = (values, current) => values.map(s => `<option value="${esc(s)}" ${s === current ? 'selected' : ''}>${esc(s)}</option>`).join('');
-const status = (s) => ({ pending: 'Ожидает', running: 'Выполняется', succeeded: 'Готово', skipped: 'Пропущено', failed: 'Ошибка', interrupted: 'Прервано', awaiting_confirm: 'Ожидает подтверждения' }[s] || s);
+const status = (s) => ({ pending: 'Ожидает', running: 'Выполняется', succeeded: 'Готово', skipped: 'Пропущено', failed: 'Ошибка', interrupted: 'Прервано', awaiting_confirm: 'Ожидает подтверждения', waiting_winget: 'Ожидает winget' }[s] || s);
 function toast(s) { const e = document.querySelector('#toast'); e.textContent = String(s); e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 9000); }
 function modal(title, body, yes = 'Подтвердить') { dlg.innerHTML = `<h2>${esc(title)}</h2><div class="modal-body">${body}</div><div class="row modal-buttons"><button id="no">Отмена</button><button id="yes" class="primary">${esc(yes)}</button></div>`; dlg.showModal(); return new Promise(resolve => { const finish = (v) => { dlg.close(); resolve(v); }; dlg.querySelector('#no').addEventListener('click', () => finish(false)); dlg.querySelector('#yes').addEventListener('click', () => finish(true)); dlg.oncancel = () => finish(false); dlg.onclick = e => { if (e.target === dlg)
     finish(false); }; }); }
 async function ask(title, value = '') { if (!await modal(title, `<input id="answer" value="${esc(value)}" style="width:100%">`, 'Сохранить'))
     return null; return dlg.querySelector('#answer').value.trim(); }
-async function load() { const x = await api('get'); c = x.config; hash = x.hash; raw = x.text; hist = x.history; mode = x.auto ? (autoFlagUsed ? mode : 'auto') : (autoFlagUsed ? mode : c.application.ui_start_mode); autoFlagUsed = true; dirty = false; external = false; render(); }
+async function load() { const x = await api('get'); configCreated = !!x.config_created; c = x.config; hash = x.hash; raw = x.text; hist = x.history; mode = x.auto ? (autoFlagUsed ? mode : 'auto') : (autoFlagUsed ? mode : c.application.ui_start_mode); autoFlagUsed = true; dirty = false; external = false; render(); }
 const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
 let uiPanelOpen = false, uiFocusReturn = null, notifyRunId = '', notifyWasActive = false;
 function theme() {
@@ -44,7 +45,7 @@ function closeUi() { document.querySelector('.ui-panel')?.remove(); document.que
 else
     document.querySelector('[data-action="ui-open"]')?.focus(); uiFocusReturn = null; }
 function about() { const version = window.__WINSETUP_VERSION__ || 'Не определена'; return modal('О программе', `<p>Версия: ${esc(version)}</p><p>Автор: TheMorgxx</p><p>© 2026 TheMorgxx</p><p>Программа создана и принадлежит TheMorgxx. Запрещено использовать её для незаконных или вредоносных целей, а также продавать и распространять за деньги.</p>`, 'Закрыть'); }
-function isRunning() { return !!run?.active || !!dev?.active; }
+function isRunning() { return bootstrapBusy || !!run?.active || !!dev?.active; }
 function notifyDone(prev, next) { if (!c?.application.ui_notify_done || !prev?.active || next?.active || !next?.finished || prev.id !== next.id)
     return; try {
     const audio = new AudioContext();
@@ -79,11 +80,45 @@ else if (!e.shiftKey && document.activeElement === last) {
     first.focus();
 } });
 function profileSelect() { return `<select id="profile">${sel(c.profiles.map((x) => x.name), c.application.selected_profile)}</select>`; }
-function readiness() { if (!inv.disks)
-    return `<p>Проверка доступности…</p>`; return `<div class="grid">${[['Права администратора', inv.admin], ['Интернет', inv.internet], ['winget', inv.winget], ['Git', inv.git]].map(([n, v]) => `<div><small>${n}</small><div class="${v ? 'good' : 'risk'}">${v ? 'Доступно' : 'Не найдено / недоступно'}</div></div>`).join('')}</div><div class="row item"><label>Диск данных <select id="drive"><option value="">Выберите диск</option>${(inv.disks || []).map((d) => `<option value="${d.DeviceID}" ${c.application.data_drive === d.DeviceID ? 'selected' : ''}>${d.DeviceID} — ${(d.FreeSpace / 1073741824).toFixed(1)} ГиБ свободно</option>`).join('')}</select></label><small>${esc(inv.windows)} · ${esc(inv.version)} · ${esc(inv.build)}</small></div>`; }
-function planTable(q) { return `<div class="warn">Предпросмотр ничего не применяет. Установки и удаления не откатываются автоматически.</div>${q.warnings.map((w) => `<p class="risk">${esc(w)}</p>`).join('')}<div class="scroll"><table><thead><tr><th>Действие</th><th>Риск</th><th>Обратимость</th></tr></thead><tbody>${q.tasks.map((t) => `<tr><td>${esc(t.name)}</td><td>${badge(t.risk)}</td><td>${esc(t.reversible)}</td></tr>`).join('')}</tbody></table></div>`; }
+function preparationPanel(report, actions = true) {
+    if (!report)
+        return '<p>Подготовка среды: проверка…</p>';
+    return `<div class="card"><h3>Подготовка среды</h3>${(configCreated || report.config_created) ? '<p class="good">Создан winsetup.toml из встроенных профилей «Мой ПК», «Безопасный минимум», «Пустой». Диск данных выбран автоматически.</p>' : ''}${bootstrapBusy ? '<p role="status">Подготовка среды выполняется. Проверка подписи и установка могут занять несколько минут.</p>' : ''}${report.checks.map((x) => `<div class="item"><strong>${esc(x.item)}</strong> — <span class="${x.status === 'ОК' ? 'good' : 'risk'}">${esc(x.status)}</span><p>${esc(x.message)}</p>${actions && x.action && (mode !== 'auto' || x.action === 'create_config') ? btn(x.action === 'install_winget' ? 'Установить winget' : 'Создать конфиг', 'bootstrap-repair', '', `data-repair="${esc(x.action)}" ${isRunning() ? 'disabled' : ''}`) : ''}</div>`).join('')}${report.winget_help ? `<p class="warn">${esc(report.winget_help)}</p>` : ''}${actions ? btn('Проверить снова', 'bootstrap-check', '', isRunning() ? 'disabled' : '') : ''}</div>`;
+}
+async function refreshPreparation() { preparation = await api('bootstrap_status'); if (c)
+    render(); await showBootstrapHelp(); }
+async function showBootstrapHelp() { if (preparation?.winget_help && !bootstrapHintShown && !dlg.open) {
+    bootstrapHintShown = true;
+    await modal('Не удалось подготовить winget', `<p>${esc(preparation.winget_help)}</p><p>Задачи winget и Microsoft Store будут ожидать winget. Остальные этапы продолжаются.</p>`, 'Понятно');
+} }
+async function repairPreparation(action) {
+    if (isRunning())
+        return;
+    const message = action === 'install_winget' ? 'Будут скачаны официальные пакеты Microsoft, проверены их подписи и выполнена установка Установщика приложений и зависимостей для текущего пользователя. Временные файлы будут удалены.' : 'Будет создан отсутствующий winsetup.toml из встроенных профилей. Существующий файл не перезаписывается.';
+    if (!await modal('Подготовка среды', `<p>${message}</p>`, 'Продолжить'))
+        return;
+    bootstrapBusy = true;
+    if (c)
+        render();
+    try {
+        toast(await api('bootstrap_repair', { action, confirmed: true }));
+        if (action === 'create_config') {
+            location.reload();
+            return;
+        }
+    }
+    catch (e) {
+        toast(e);
+    }
+    finally {
+        bootstrapBusy = false;
+    }
+    await refreshPreparation();
+}
+function readiness() { return preparationPanel(preparation || inv.bootstrap) + `<div class="row item"><label>Диск данных <select id="drive"><option value="">Выберите диск</option>${(inv.disks || []).map((d) => `<option value="${d.DeviceID}" ${c.application.data_drive === d.DeviceID ? 'selected' : ''}>${d.DeviceID} — ${(d.FreeSpace / 1073741824).toFixed(1)} ГиБ свободно</option>`).join('')}</select></label><small>${esc(inv.windows)} · ${esc(inv.version)} · ${esc(inv.build)} · Git: ${inv.git ? 'доступен' : 'не найден'}</small></div>`; }
+function planTable(q) { return `<div class="warn">Предпросмотр ничего не применяет. Установки и удаления не откатываются автоматически.</div>${preparationPanel(q.readiness.bootstrap, false)}${q.warnings.map((w) => `<p class="risk">${esc(w)}</p>`).join('')}<div class="scroll"><table><thead><tr><th>Действие</th><th>Риск</th><th>Обратимость</th></tr></thead><tbody>${q.tasks.map((t) => `<tr><td>${esc(t.name)}</td><td>${badge(t.risk)}</td><td>${esc(t.reversible)}</td></tr>`).join('')}</tbody></table></div>`; }
 function progress() { if (!run)
-    return '<p>Запусков пока нет.</p>'; const done = run.tasks.filter((t) => ['succeeded', 'skipped', 'failed'].includes(t.status)).length; const held = run.tasks.filter((t) => t.status === 'awaiting_confirm'), pt = run.tasks.find((t) => t.action.kind === 'RestorePoint'); return `<strong>${done} из ${run.tasks.length} задач</strong><div class="ui-progress-track" role="progressbar" aria-label="Прогресс выполнения" aria-valuemin="0" aria-valuemax="${run.tasks.length}" aria-valuenow="${done}"><div class="ui-progress-fill" style="transform:scaleX(${run.tasks.length ? done / run.tasks.length : 0})"></div></div>${run.active ? '<span class="ui-running" role="status">Идёт выполнение</span>' : ''}${held.length ? `<div class="warn">Точка восстановления не создана${pt?.detail ? ': ' + esc(pt.detail) : ''}. Твики Windows и удаление встроенных приложений (${held.length}) ожидают подтверждения продолжить без точки. Остальные этапы выполняются как обычно.</div>` : ''}<p>${esc(run.tasks.find((t) => t.status === 'running')?.name || (run.finished ? 'Выполнение завершено' : run.active ? 'Ожидание' : 'Выполнение остановлено'))}</p><div class="row">${btn(run.paused ? 'Продолжить' : 'Пауза', 'pause', '', !run.active ? 'disabled' : '')}${btn('Отмена', 'cancel', '', !run.active ? 'disabled' : '')}${!run.active ? btn('Повторить ошибочные / продолжить', 'resume', '', 'data-id="' + run.id + '"') : ''}${!run.active && held.length ? btn('Продолжить без точки восстановления', 'resume-no-point', 'primary', 'data-id="' + run.id + '"') : ''}</div><details><summary>Журнал</summary><pre>${esc(run.log.join('\n'))}</pre></details>`; }
+    return '<p>Запусков пока нет.</p>'; const done = run.tasks.filter((t) => ['succeeded', 'skipped', 'failed', 'waiting_winget'].includes(t.status)).length; const held = run.tasks.filter((t) => t.status === 'awaiting_confirm'), pt = run.tasks.find((t) => t.action.kind === 'RestorePoint'); return `<strong>${done} из ${run.tasks.length} задач</strong><div class="ui-progress-track" role="progressbar" aria-label="Прогресс выполнения" aria-valuemin="0" aria-valuemax="${run.tasks.length}" aria-valuenow="${done}"><div class="ui-progress-fill" style="transform:scaleX(${run.tasks.length ? done / run.tasks.length : 0})"></div></div>${run.active ? '<span class="ui-running" role="status">Идёт выполнение</span>' : ''}${held.length ? `<div class="warn">Точка восстановления не создана${pt?.detail ? ': ' + esc(pt.detail) : ''}. Твики Windows и удаление встроенных приложений (${held.length}) ожидают подтверждения продолжить без точки. Остальные этапы выполняются как обычно.</div>` : ''}<p>${esc(run.tasks.find((t) => t.status === 'running')?.name || (run.finished ? 'Выполнение завершено' : run.active ? 'Ожидание' : 'Выполнение остановлено'))}</p><div class="row">${btn(run.paused ? 'Продолжить' : 'Пауза', 'pause', '', !run.active ? 'disabled' : '')}${btn('Отмена', 'cancel', '', !run.active ? 'disabled' : '')}${!run.active ? btn('Повторить ошибочные / продолжить', 'resume', '', 'data-id="' + run.id + '"') : ''}${!run.active && held.length ? btn('Продолжить без точки восстановления', 'resume-no-point', 'primary', 'data-id="' + run.id + '"') : ''}</div><details><summary>Журнал</summary><pre>${esc(run.log.join('\n'))}</pre></details>`; }
 function field(section, index, key, label, type = 'text') { const val = c[section][index][key]; return `<label>${esc(label)}<input type="${type}" data-section="${section}" data-index="${index}" data-field="${key}" value="${esc(val)}"></label>`; }
 function selected(group, id) { return p()[group].includes(id); }
 function check(group, id) { return `<input type="checkbox" data-group="${group}" data-id="${esc(id)}" ${selected(group, id) ? 'checked' : ''}>`; }
@@ -284,7 +319,7 @@ async function save() { await api('save', { config: c, expected: hash }); await 
 async function before() { if (dirty)
     await save(); }
 async function getPlan() { await before(); plan = await api('plan', { profile: c.application.selected_profile }); return plan; }
-async function launch(resume, noPoint = false) { const q = await getPlan(); let noPointOk = false; if (noPoint) {
+async function launch(resume, noPoint = false) { const q = await getPlan(); const needsWinget = !q.readiness.bootstrap?.winget_ready && q.tasks.some((t) => t.action.kind === 'Program' && c.programs.some((p) => p.key === t.action.value && ['winget', 'msstore'].includes(p.source))); let noPointOk = false; if (noPoint) {
     const old = run && run.id === resume ? run : hist.find(h => h.id === resume);
     const held = (old?.tasks || []).filter((t) => t.status === 'awaiting_confirm');
     if (!held.length) {
@@ -304,7 +339,8 @@ else if (removals.length) {
     confirmed = await modal('Подтвердите удаление встроенных приложений', `<p>Только текущий пользователь. Автоматического возврата из Store нет.</p><pre>${esc(removals.map((t) => t.name).join('\n'))}</pre>`, 'Подтверждаю удаление');
     if (!confirmed)
         return;
-} let password = ''; const gated = q.tasks.some((t) => ['Tweak', 'Remove'].includes(t.action.kind)); const box = mode === 'auto' && gated && !noPointOk ? '<p><label><input id="no-point" type="checkbox"> Если точку восстановления создать не удастся — продолжить твики Windows и удаление встроенных приложений без неё</label></p>' : ''; if (p().restore_backup) {
+} let password = ''; const gated = q.tasks.some((t) => ['Tweak', 'Remove'].includes(t.action.kind)); const wingetInfo = needsWinget ? '<p class="warn">Подготовка среды: будет скачан и установлен winget с официальными зависимостями Microsoft для текущего пользователя. Подтверждая запуск, вы разрешаете эту установку. При сбое зависимые задачи будут ожидать winget, остальные продолжатся.</p>' : ''; const box = wingetInfo + (mode === 'auto' && gated && !noPointOk ? '<p><label><input id="no-point" type="checkbox"> Если точку восстановления создать не удастся — продолжить твики Windows и удаление встроенных приложений без неё</label></p>' : ''); if (needsWinget && noPointOk && !await modal('Подготовка среды', wingetInfo, 'Установить winget и продолжить'))
+    return; if (p().restore_backup) {
     if (!await modal('Пароль Data Vault', '<p>Firefox должен быть закрыт. Существующие данные сохранятся в .bak.</p><input id="password" type="password" autocomplete="off">' + box, 'Начать'))
         return;
     const el = dlg.querySelector('#password');
@@ -313,7 +349,7 @@ else if (removals.length) {
 }
 else if (!noPointOk && !await modal('Начать выполнение?', `<p>${q.tasks.length} задач. Перед изменениями будет создана точка восстановления. Если она не создастся, твики Windows и удаление встроенных приложений будут ждать вашего подтверждения. Запускайте UAC под тем же пользователем, чьи настройки переносите.</p>${box}`, 'Запустить'))
     return; if (box && dlg.querySelector('#no-point')?.checked)
-    noPointOk = true; await api('start', { confirm_removal: confirmed, password, resume, no_point_ok: noPointOk }); password = ''; page = 'Выполнение'; run = await api('state'); render(); }
+    noPointOk = true; await api('start', { confirm_removal: confirmed, password, resume, no_point_ok: noPointOk, winget_consent: needsWinget }); password = ''; page = 'Выполнение'; run = await api('state'); render(); }
 async function doVault(mode) { await before(); const kind = mode === 'prepare' ? 'folder' : mode === 'create' ? 'save' : 'open'; const path = await api('browse', { kind }); if (!path)
     return; if (!await modal(mode === 'restore' ? 'Восстановление' : 'Пароль Data Vault', '<p>Не менее 8 символов. Пароль не сохраняется. Firefox должен быть закрыт.</p><input id="password" type="password" autocomplete="new-password"><p>Дождитесь проверки целостности. Во время операции не закрывайте приложение.</p>', 'Продолжить'))
     return; const el = dlg.querySelector('#password'); let password = el.value; el.value = ''; toast('Data Vault: обработка и проверка файлов…'); try {
@@ -324,7 +360,16 @@ finally {
 } }
 document.addEventListener('click', async (ev) => { const el = ev.target.closest('[data-action]'); if (!el)
     return; const a = el.dataset.action; try {
-    if (a?.startsWith('dev-')) {
+    if (a === 'bootstrap-repair') {
+        await repairPreparation(el.dataset.repair);
+    }
+    else if (a === 'bootstrap-check') {
+        await refreshPreparation();
+        if (!c) {
+            location.reload();
+        }
+    }
+    else if (a?.startsWith('dev-')) {
         await devAction(a);
     }
     else if (a === 'ui-open') {
@@ -645,6 +690,9 @@ document.addEventListener('input', ev => { const el = ev.target; if (el.id === '
 setInterval(async () => { if (loading || !c)
     return; loading = true; try {
     const r = await api('state');
+    if ((run?.active && !r?.active) || (r?.tasks?.some((t) => t.status === 'waiting_winget') && !run?.tasks?.some((t) => t.status === 'waiting_winget'))) {
+        void refreshPreparation().catch(toast);
+    }
     if (JSON.stringify(r) !== JSON.stringify(run)) {
         notifyDone(run, r);
         run = r;
@@ -681,11 +729,16 @@ finally {
 try {
     await load();
     inv = await api('inventory');
+    preparation = inv.bootstrap;
     render();
     if (mode !== 'choose')
         await api('resize', { auto: mode === 'auto' });
 }
 catch (e) {
-    app.innerHTML = `<main><h1>Не удалось загрузить WinSetup</h1><pre>${esc(e)}</pre><p>Исправьте winsetup.toml рядом с exe и перезапустите приложение. Рабочая копия сохранена в .bak.</p></main>`;
+    try {
+        preparation = await api('bootstrap_status');
+    }
+    catch { }
+    app.innerHTML = `<main><h1>Подготовка среды</h1><pre>${esc(e)}</pre>${preparationPanel(preparation)}<p>Если существующий конфиг повреждён, исправьте его вручную; программа его не заменяет.</p></main>`;
 }
 export {};

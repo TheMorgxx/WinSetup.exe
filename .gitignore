@@ -18,3 +18,10 @@
 .env
 .env.*
 !.env.example
+/runs/
+*.wsvault
+*.pfx
+*.p12
+*.pem
+*.key
+

@@ -1,6 +1,6 @@
 use crate::{
     model::{self, no_links, resolve, Config},
-    storage, system,
+    bootstrap, storage, system,
 };
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ const NO_POINT_DETAIL: &str =
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value")]
 pub enum Action {
+    Bootstrap,
     Check,
     RestorePoint,
     Folder(String),
@@ -69,6 +70,7 @@ pub struct Rollback {
 }
 pub struct Engine {
     pub root: PathBuf,
+    pub bootstrap: bootstrap::Runtime,
     pub current: Mutex<Option<Run>>,
     pub busy: AtomicBool,
     pub pause: AtomicBool,
@@ -78,6 +80,7 @@ impl Engine {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
+            bootstrap: bootstrap::Runtime::default(),
             current: Mutex::new(None),
             busy: AtomicBool::new(false),
             pause: AtomicBool::new(false),
@@ -127,7 +130,10 @@ pub fn plan(c: &Config, name: &str, network: bool) -> Result<Plan> {
         .iter()
         .find(|p| p.name == name)
         .context("Профиль не найден")?;
-    let readiness = system::inventory()?;
+    let mut readiness = system::inventory()?;
+    let preparation = bootstrap::report(&storage::root()?, Some(c), &readiness, None);
+    readiness["winget"] = serde_json::json!(preparation.winget_ready);
+    readiness["bootstrap"] = serde_json::to_value(preparation)?;
     let mut warnings = vec![];
     if readiness["admin"] != true {
         warnings.push("Нет прав администратора: реальное выполнение заблокировано".into());
@@ -136,9 +142,9 @@ pub fn plan(c: &Config, name: &str, network: bool) -> Result<Plan> {
         warnings.push("Диск данных не выбран: выберите его перед запуском".into());
     }
     if readiness["winget"] != true && !p.programs.is_empty() {
-        warnings.push("winget отсутствует: программы будут отмечены для ручной установки".into());
+        warnings.push("winget отсутствует: подготовка среды предложит установку; при отказе или сбое зависимые задачи будут ожидать winget".into());
     }
-    if network && !system::internet() {
+    if network && readiness["bootstrap"]["checks"].as_array().into_iter().flatten().any(|x| x["id"]=="internet" && x["status"]!="ОК") {
         warnings.push("Интернет недоступен: установки и клонирование могут не пройти".into());
     }
     if readiness["windows"]
@@ -160,6 +166,7 @@ pub fn plan(c: &Config, name: &str, network: bool) -> Result<Plan> {
             action,
         });
     };
+    push("Подготовка среды".into(), "Осторожно", "winget устанавливается только с подтверждением", Action::Bootstrap);
     push(
         "Проверка системы".into(),
         "Безопасно",
@@ -510,6 +517,12 @@ fn execute(
 ) -> Result<String> {
     let run = e.state().unwrap();
     match &t.action {
+        Action::Bootstrap => {
+            let needed=run.tasks.iter().any(|t| matches!(&t.action,Action::Program(key) if c.programs.iter().any(|p| &p.key==key && ["winget","msstore"].contains(&p.source.as_str()))));
+            let (ready,message)=e.bootstrap.prepare(needed,run.plan.readiness["winget_consent"]==true);
+            if let Some(r)=e.current.lock().unwrap().as_mut() {r.plan.readiness["winget_ready"]=serde_json::json!(ready);}
+            Ok(message)
+        }
         Action::Check => {
             let inv = system::inventory()?;
             ensure!(inv["admin"] == true, "Нужны права администратора");
@@ -622,6 +635,7 @@ fn execute(
         Action::Final => {
             let mut missing = vec![];
             for t in &run.tasks {
+                if t.status=="waiting_winget" {continue;}
                 if let Action::Program(k) = &t.action {
                     let p = c.programs.iter().find(|p| &p.key == k).unwrap();
                     if p.source != "git" && !system::installed(p).unwrap_or(false) {
@@ -637,13 +651,15 @@ fn execute(
 pub fn start(
     e: Arc<Engine>,
     c: Config,
-    p: Plan,
+    mut p: Plan,
     removal_confirmed: bool,
     password: String,
     resume: Option<String>,
     force_vencord: bool,
     no_point_ok: bool,
+    winget_consent: bool,
 ) -> Result<String> {
+    p.readiness["winget_consent"]=serde_json::json!(winget_consent);
     ensure!(!e.busy.swap(true, Ordering::SeqCst), "Выполнение уже идёт");
     let setup = (|| -> Result<Run> {
         ensure!(
@@ -667,7 +683,13 @@ pub fn start(
                 old.plan.fingerprint == fingerprint(&c),
                 "Для продолжения нужен исходный конфиг"
             );
+            old.plan.readiness["winget_consent"]=serde_json::json!(winget_consent);
+            if !old.tasks.iter().any(|t|matches!(t.action,Action::Bootstrap)) {
+                if let Some(t)=p.tasks.iter().find(|t|matches!(t.action,Action::Bootstrap)) {old.tasks.insert(0,t.clone());}
+                for (id,t) in old.tasks.iter_mut().enumerate() {t.id=id;}
+            }
             for t in &mut old.tasks {
+                if matches!(t.action,Action::Bootstrap) {t.status="pending".into();}
                 if !["succeeded", "skipped"].contains(&t.status.as_str()) {
                     ensure!(p.tasks.iter().any(|allowed|serde_json::to_value(&allowed.action).ok()==serde_json::to_value(&t.action).ok()),"Продолжение содержит действие вне текущего плана; сформируйте новый запуск");
                     t.status = "pending".into();
@@ -754,6 +776,10 @@ pub fn start(
             let t = e.state().unwrap().tasks[i].clone();
             if ["succeeded", "skipped", AWAITING].contains(&t.status.as_str()) {
                 continue;
+            }
+            if e.state().unwrap().plan.readiness["winget_ready"]==false && matches!(&t.action,Action::Program(key) if c.programs.iter().any(|p| &p.key==key && ["winget","msstore"].contains(&p.source.as_str()))) {
+                if let Some(r)=e.current.lock().unwrap().as_mut() {r.tasks[i].status="waiting_winget".into();r.tasks[i].detail="Ожидает winget; задача пропущена без запуска установщика".into();}
+                let _=e.save();continue;
             }
             if let Some(r) = e.current.lock().unwrap().as_mut() {
                 r.tasks[i].status = "running".into();

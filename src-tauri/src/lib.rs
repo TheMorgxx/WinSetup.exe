@@ -5,3 +5,5 @@ pub mod system;
 pub mod vault;
 
 pub mod devtest;
+
+pub mod bootstrap;

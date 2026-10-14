@@ -7,7 +7,7 @@ use std::{
     sync::{atomic::Ordering, Arc, Mutex},
 };
 use tauri::{Manager, State};
-use winsetup::{devtest, engine, model, storage, system, vault};
+use winsetup::{bootstrap, devtest, engine, model, storage, system, vault};
 #[derive(Clone)]
 struct AppState {
     dev: Arc<devtest::Runner>,
@@ -92,6 +92,22 @@ fn dispatch(
         anyhow::bail!("Дождитесь завершения диагностики или остановите её");
     }
     match op {
+        "bootstrap_status" => {
+            let config=storage::load(&e.root).ok();
+            let inv=system::inventory().unwrap_or(Value::Null);
+            Ok(json!(bootstrap::report(&e.root,config.as_ref(),&inv,Some(&e.bootstrap))))
+        }
+        "bootstrap_repair" => {
+            ensure!(payload["confirmed"]==true,"Подтвердите подготовку среды");
+            ensure!(!e.busy.swap(true,Ordering::SeqCst),"Дождитесь завершения текущей операции");
+            let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||match payload["action"].as_str() {
+                Some("create_config")=>e.bootstrap.create_config(&e.root),
+                Some("install_winget")=>e.bootstrap.install_winget(true),
+                _=>anyhow::bail!("Неизвестное действие подготовки"),
+            })).unwrap_or_else(|_|Err(anyhow::anyhow!("Ошибка подготовки среды")));
+            e.busy.store(false,Ordering::SeqCst);
+            Ok(json!(result?))
+        }
         "dev_list" => Ok(json!(devtest::list(&e.root))),
         "dev_real_info" => Ok(devtest::real_info(&e.root, payload["startup"] == true)?),
         "dev_real_run" => {
@@ -124,7 +140,7 @@ fn dispatch(
             let raw = fs::read_to_string(e.root.join("winsetup.toml"))?;
             let c = model::parse(&raw)?;
             Ok(
-                json!({"config":c,"text":raw,"hash":storage::hash(raw.as_bytes()),"auto":std::env::args().any(|x|x=="--auto"),"root":e.root,"history":history(&e.root)}),
+                json!({"config":c,"text":raw,"hash":storage::hash(raw.as_bytes()),"auto":std::env::args().any(|x|x=="--auto"),"config_created":e.bootstrap.config_created(),"root":e.root,"history":history(&e.root)}),
             )
         }
         "save" => {
@@ -152,7 +168,11 @@ fn dispatch(
             let mut inv = system::inventory()?;
             inv["startup"] = system::startup()?;
             inv["displays"] = json!(system::displays());
-            inv["internet"] = json!(system::internet());
+            let config=storage::load(&e.root).ok();
+            let preparation=bootstrap::report(&e.root,config.as_ref(),&inv,Some(&e.bootstrap));
+            inv["winget"]=json!(preparation.winget_ready);
+            inv["internet"]=json!(preparation.checks.iter().any(|x|x.id=="internet" && x.status==bootstrap::Status::Ok));
+            inv["bootstrap"]=json!(preparation);
             Ok(inv)
         }
         "plan" => {
@@ -178,7 +198,8 @@ fn dispatch(
                 payload["password"].as_str().unwrap_or("").to_string(),
                 payload["resume"].as_str().map(str::to_string),
                 false,
-                payload["no_point_ok"].as_bool().unwrap_or(false)
+                payload["no_point_ok"].as_bool().unwrap_or(false),
+                payload["winget_consent"]==true
             )?))
         }
         "vencord" => {
@@ -192,7 +213,7 @@ fn dispatch(
             p.tasks.retain(|t| {
                 matches!(
                     t.action,
-                    engine::Action::Check | engine::Action::RestorePoint
+                    engine::Action::Bootstrap | engine::Action::Check | engine::Action::RestorePoint
                 ) || matches!(&t.action,engine::Action::Program(k)if k=="vencord")
             });
             ensure!(
@@ -209,6 +230,7 @@ fn dispatch(
                 String::new(),
                 None,
                 true,
+                false,
                 false
             )?))
         }
@@ -430,17 +452,11 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let root = storage::root()?;
-            let config = root.join("winsetup.toml");
-            if !config.exists() {
-                storage::atomic(
-                    &config,
-                    model::render(&model::defaults())?.as_bytes(),
-                    false,
-                )?;
-            }
+            let engine=Arc::new(engine::Engine::new(root));
+            engine.bootstrap.initialize(&engine.root);
             app.manage(AppState {
                 dev: Arc::new(devtest::Runner::default()),
-                engine: Arc::new(engine::Engine::new(root)),
+                engine,
                 plan: Arc::new(Mutex::new(None)),
                 remote: Arc::new(Mutex::new(None)),
             });

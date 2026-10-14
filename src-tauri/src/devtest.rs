@@ -41,6 +41,7 @@ pub fn list(root: &Path) -> Vec<Test> {
     let mut add = |group, id: &str, name: &str| tests.push(Test { id: id.into(), group, name: name.into(), timeout_s: if group == 4 {45} else {60} });
     for (group, id, name) in [
         (1,"environment","Окружение и свободное место"),
+        (1,"bootstrap","Подготовка среды"),
         (2,"config","Загрузка, валидация и обратное сохранение конфигурации"),
         (2,"legacy","Совместимость старых конфигураций и тип dev_mode"),
         (2,"secrets","Секреты и маскирование"),
@@ -359,6 +360,11 @@ pub fn open_logs(root: &Path) -> Result<()> {
 fn check(root: &Path, id: &str) -> Result<Outcome> {
     match id {
         "environment" => environment(root),
+        "bootstrap" => {
+            let checks=crate::bootstrap::readonly(root);
+            let ok=checks.iter().all(|c|c.status==crate::bootstrap::Status::Ok);
+            Ok(outcome(if ok {Status::PASS}else{Status::WARN},"Прочитан статус конфига и winget; скачивание и починка не выполнялись",pretty(&checks)))
+        },
         "config" => {
             let current=storage::load(root)?;
             let mut temp=Temp::new()?;
@@ -439,7 +445,7 @@ fn check(root: &Path, id: &str) -> Result<Outcome> {
 }
 fn validate_plan(plan: &engine::Plan) -> Result<()> {
     use engine::Action;
-    let rank=|a:&Action|match a {Action::Check=>0,Action::RestorePoint=>1,Action::Folder(_)=>2,Action::Program(_)=>3,Action::Tweak(_,_)=>4,Action::Remove(_)=>5,Action::Startup(_)=>6,Action::Repository(_)=>7,Action::Restore=>8,Action::Final=>9};
+    let rank=|a:&Action|match a {Action::Bootstrap|Action::Check=>0,Action::RestorePoint=>1,Action::Folder(_)=>2,Action::Program(_)=>3,Action::Tweak(_,_)=>4,Action::Remove(_)=>5,Action::Startup(_)=>6,Action::Repository(_)=>7,Action::Restore=>8,Action::Final=>9};
     ensure!(matches!(plan.tasks.first().map(|t|&t.action),Some(Action::Check)) && matches!(plan.tasks.last().map(|t|&t.action),Some(Action::Final)),"Нет начального/финального этапа");
     ensure!(plan.tasks.windows(2).all(|w|rank(&w[0].action)<=rank(&w[1].action)),"Нарушен порядок этапов");
     if let Some(v)=plan.tasks.iter().position(|t|matches!(&t.action,Action::Program(k) if k=="vencord")) {
