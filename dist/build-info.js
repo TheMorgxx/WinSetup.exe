@@ -1,1 +1,1 @@
-window.__WINSETUP_VERSION__="1.1.3";
+window.__WINSETUP_VERSION__="1.1.4";
