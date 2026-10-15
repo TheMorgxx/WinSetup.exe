@@ -444,6 +444,27 @@ impl std::fmt::Display for VerificationPending {
 }
 impl std::error::Error for VerificationPending {}
 fn verification_pending(message:impl Into<String>)->anyhow::Error {anyhow::Error::new(VerificationPending(message.into()))}
+fn probe_error(err:anyhow::Error)->anyhow::Error {
+    if system::read_interrupted(&err) {verification_pending(format!("Проверка недоступна: {err}. Нужна проверка результата; установщик повторно не запускался."))} else {err}
+}
+fn winget_already_installed(code:Option<i32>)->Option<u32> {
+    code.map(|c|c as u32).filter(|c|matches!(c,0x8A15002B | 0x8A150061))
+}
+fn already_message(code:u32)->String {format!("Уже установлено (winget, код 0x{code:08X})")}
+fn saved_already_code(task:&Task)->Option<u32> {
+    [0x8A15002B,0x8A150061].into_iter().find(|code|task.detail.starts_with(&already_message(*code)))
+}
+fn confirm_already_installed(code:u32,confirmed:Result<Option<String>>)->Result<String> {
+    let message=already_message(code);
+    match confirmed {
+        Ok(Some(evidence)) => Ok(format!("{message}\nОснование: {evidence}")),
+        Ok(None) => Err(verification_pending(format!("{message}\nUninstall не подтвердил установку. Нужна проверка результата; установщик повторно не запускался."))),
+        Err(err) => Err(verification_pending(format!("{message}\nПроверка Uninstall недоступна: {err}. Нужна проверка результата; установщик повторно не запускался."))),
+    }
+}
+fn successful_task_status(message:&str)->&'static str {
+    if message.starts_with("Пропущено:") || message.starts_with("Уже установлена максимальная частота ") || message.starts_with("Уже установлено (winget, код ") {"skipped"} else {"succeeded"}
+}
 fn verification_only(t:&Task)->bool {
     t.verification_only || (matches!(t.action,Action::Program(_)) &&
         (t.status=="needs_verification" || t.detail.contains("Код успеха=true; постпроверка не нашла программу")))
@@ -452,13 +473,17 @@ fn poll_verification(mut probe:impl FnMut()->Result<bool>,mut wait:impl FnMut(),
     let mut last="Программа пока не обнаружена".to_string();
     for attempt in 0..attempts {
         if cancelled(){return Err(verification_pending("Проверка остановлена пользователем; установщик повторно не запускался"));}
-        match probe() {Ok(true)=>return Ok(()),Ok(false)=>last="Программа пока не обнаружена".into(),Err(e)=>last=format!("Проверка недоступна: {e}")}
+        match probe() {
+            Ok(true)=>return Ok(()),Ok(false)=>last="Программа пока не обнаружена".into(),
+            Err(e) if system::read_interrupted(&e)=>return Err(probe_error(e)),
+            Err(e)=>last=format!("Проверка недоступна: {e}"),
+        }
         if attempt+1<attempts {wait();}
     }
     Err(verification_pending(format!("{last}. Нужна проверка результата; «Продолжить» повторит только чтение состояния, без переустановки.")))
 }
 fn verify_program(e:&Engine,p:&model::Program)->Result<()> {
-    poll_verification(||system::installed(p),||{
+    poll_verification(||system::installed_evidence_cancellable(p,Some(&e.cancel)).map(|v|v.is_some()),||{
         for _ in 0..20 {if e.cancel.load(Ordering::SeqCst){break;}std::thread::sleep(std::time::Duration::from_millis(100));}
     },||e.cancel.load(Ordering::SeqCst),6)
 }
@@ -483,11 +508,14 @@ fn install(e:&Engine, t:&Task, c: &Config, p: &model::Program, force: bool) -> R
         return clone_repo(&p.url, &resolve(&p.location, c)?, "");
     }
     if verification_only(t) {
+        if let Some(code)=saved_already_code(t) {
+            return confirm_already_installed(code,system::uninstall_evidence(p,Some(&e.cancel)));
+        }
         verify_program(e,p)?;
         return Ok("Установка подтверждена повторной проверкой; установщик не запускался".into());
     }
     if !force {
-        if let Some(evidence)=system::installed_evidence(p)? {
+        if let Some(evidence)=system::installed_evidence_cancellable(p,Some(&e.cancel)).map_err(probe_error)? {
             return Ok(format!("Пропущено: программа найдена; установка пропущена\nОснование: {evidence}"));
         }
     }
@@ -499,6 +527,7 @@ fn install(e:&Engine, t:&Task, c: &Config, p: &model::Program, force: bool) -> R
             .context("Нет Discord в конфиге")?;
         verify_program(e,discord).map_err(|err|anyhow::anyhow!("Сначала дождитесь подтверждения установки Discord; Vencord не запускался: {err}"))?;
     }
+    if e.cancel.load(Ordering::SeqCst) {return Err(verification_pending("Проверка остановлена пользователем; установщик не запускался"));}
     let result = if p.source == "direct" {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("verified.msi");
@@ -553,6 +582,17 @@ fn install(e:&Engine, t:&Task, c: &Config, p: &model::Program, force: bool) -> R
         remember_verification(e,t.id,true)?;
         system::command_result("winget.exe", &args)?
     };
+    if ["winget","msstore"].contains(&p.source.as_str()) {
+        if let Some(code)=winget_already_installed(result.code) {
+            // Сохраняем правило проверки до чтения: продолжение и финальная проверка
+            // также требуют Uninstall и не подменяют его результатом winget list.
+            if let Some(run)=e.current.lock().unwrap().as_mut() {
+                run.tasks[t.id].detail=already_message(code);
+            }
+            e.save().map_err(|err|verification_pending(format!("{}\nНе удалось сохранить результат: {err}",already_message(code))))?;
+            return confirm_already_installed(code,system::uninstall_evidence(p,Some(&e.cancel)));
+        }
+    }
     let restart=p.source=="direct" && matches!(result.code,Some(3010 | 1641));
     if !result.success && !restart {remember_verification(e,t.id,false)?;return Err(installer_failure(p,&result));}
     // Durable marker: resume after a successful installer only rechecks; it cannot reinstall.
@@ -693,43 +733,62 @@ fn execute(
             );
             crate::vault::restore(c, &resolve(&c.backup.vault_path, c)?, password)
         }
-        Action::Final => check_final_programs(e,c,&run,system::installed),
+        Action::Final => check_final_programs(e,c,&run,|p,t| {
+            if saved_already_code(t).is_some() {system::uninstall_evidence(p,Some(&e.cancel)).map(|v|v.is_some())}
+            else {system::installed_evidence_cancellable(p,Some(&e.cancel)).map(|v|v.is_some())}
+        }),
     }
 }
-fn check_final_programs(e:&Engine,c:&Config,run:&Run,mut inspect:impl FnMut(&model::Program)->Result<bool>)->Result<String> {
+fn check_final_programs(e:&Engine,c:&Config,run:&Run,mut inspect:impl FnMut(&model::Program,&Task)->Result<bool>)->Result<String> {
             let mut issues=Vec::new();
             let mut errors=Vec::new();
+            let mut unavailable=Vec::new();
             for task in &run.tasks {
+                if e.cancel.load(Ordering::SeqCst) {return Err(verification_pending("Финальная проверка остановлена пользователем"));}
                 if task.status=="waiting_winget" {continue;}
                 if let Action::Program(key)=&task.action {
                     let program=c.programs.iter().find(|p|&p.key==key).context("Программа отсутствует в конфиге")?;
                     if program.source=="git" {continue;}
-                    match inspect(program) {
+                    match inspect(program,task) {
                         Ok(true) if task.status=="failed" && !verification_only(task) =>
                             issues.push(format!("{}: установщик завершился с ошибкой; обнаружение приложения само по себе не подтверждает выполнение задачи",program.name)),
                         Ok(true) => {
                             if verification_only(task) && !["succeeded","skipped"].contains(&task.status.as_str()) {
                                 if let Some(r)=e.current.lock().unwrap().as_mut() {
-                                    r.tasks[task.id].status="succeeded".into();
-                                    r.tasks[task.id].detail="Установка подтверждена финальной проверкой; повторный установщик не запускался".into();
+                                    if let Some(code)=saved_already_code(task) {
+                                        r.tasks[task.id].status="skipped".into();
+                                        r.tasks[task.id].detail=format!("{}\nUninstall подтвердил точное имя и издателя при финальной проверке; установщик повторно не запускался",already_message(code));
+                                    } else {
+                                        r.tasks[task.id].status="succeeded".into();
+                                        r.tasks[task.id].detail="Установка подтверждена финальной проверкой; повторный установщик не запускался".into();
+                                    }
                                 }
                             }
                         }
                         check => {
-                            let reason=match check {Err(err)=>{errors.push(format!("{}: проверка недоступна: {err}",program.name));format!("проверка недоступна: {err}")},_=>"установка пока не подтверждена".into()};
-                            issues.push(format!("{}: {}",program.name,reason));
+                            let reason=match check {
+                                Err(err)=>{
+                                    if system::read_interrupted(&err) || saved_already_code(task).is_some() {unavailable.push(format!("{}: {err}",program.name));}
+                                    else {errors.push(format!("{}: проверка недоступна: {err}",program.name));}
+                                    format!("проверка недоступна: {err}")
+                                },
+                                _=>{issues.push(format!("{}: установка пока не подтверждена",program.name));"установка пока не подтверждена".into()},
+                            };
                             if ["succeeded","skipped","needs_verification"].contains(&task.status.as_str()) || verification_only(task) {
                                 if let Some(r)=e.current.lock().unwrap().as_mut() {
                                     r.tasks[task.id].status="needs_verification".into();
                                     r.tasks[task.id].verification_only=true;
-                                    r.tasks[task.id].detail=format!("{reason}. Продолжение повторит проверку без установки.");
+                                    let prefix=saved_already_code(task).map(|code|format!("{}\n",already_message(code))).unwrap_or_default();
+                                    r.tasks[task.id].detail=format!("{prefix}{reason}. Продолжение повторит проверку без установки.");
                                 }
                             }
                         }
                     }
                 }
             }
-            final_check_summary(&issues,&errors)
+            let mut summary=final_check_summary(&issues,&errors)?;
+            if !unavailable.is_empty() {summary.push_str(&format!("\nПредупреждение: проверка недоступна: {}",unavailable.join("; ")));}
+            Ok(summary)
         }
 fn final_check_summary(manual:&[String],errors:&[String])->Result<String> {
     ensure!(errors.is_empty(),"Не удалось выполнить финальную проверку:\n{}",errors.join("\n"));
@@ -910,11 +969,7 @@ pub fn start(
                 .unwrap_or_default();
             let (status, msg) = match result {
                 Ok(s) => (
-                    if s.starts_with("Пропущено:") || s.starts_with("Уже установлена максимальная частота ") {
-                        "skipped"
-                    } else {
-                        "succeeded"
-                    },
+                    successful_task_status(&s),
                     s,
                 ),
                 Err(err) if point_failed && no_point_ok => (
@@ -1104,11 +1159,11 @@ mod reliability_tests {
         let mut t=task();t.status="needs_verification".into();t.verification_only=true;
         let mut run=Run{id:"fixture".into(),plan:Plan{profile:"fixture".into(),fingerprint:"".into(),tasks:vec![],warnings:vec![],readiness:serde_json::json!({}),displays:vec![]},active:true,paused:false,tasks:vec![t],log:vec![],technical:vec![],finished:false};
         *e.current.lock().unwrap()=Some(run.clone());
-        check_final_programs(&e,&c,&run,|_|Ok(true)).unwrap();
+        check_final_programs(&e,&c,&run,|_,_|Ok(true)).unwrap();
         assert_eq!(e.state().unwrap().tasks[0].status,"succeeded");
         run.tasks[0].status="failed".into();run.tasks[0].verification_only=false;
         *e.current.lock().unwrap()=Some(run.clone());
-        assert!(check_final_programs(&e,&c,&run,|_|Ok(true)).unwrap().contains("Требуют ручной установки:"));
+        assert!(check_final_programs(&e,&c,&run,|_,_|Ok(true)).unwrap().contains("Требуют ручной установки:"));
         assert_eq!(e.state().unwrap().tasks[0].status,"failed");
     }
     #[test]
@@ -1125,10 +1180,52 @@ mod reliability_tests {
         let mut t=task();t.status="succeeded".into();
         let run=Run{id:"fixture".into(),plan:Plan{profile:"fixture".into(),fingerprint:"".into(),tasks:vec![],warnings:vec![],readiness:serde_json::json!({}),displays:vec![]},active:true,paused:false,tasks:vec![t],log:vec![],technical:vec![],finished:false};
         *e.current.lock().unwrap()=Some(run.clone());
-        let error=check_final_programs(&e,&c,&run,|_|anyhow::bail!("источник недоступен")).unwrap_err().to_string();
+        let error=check_final_programs(&e,&c,&run,|_,_|anyhow::bail!("источник недоступен")).unwrap_err().to_string();
         assert!(error.contains("источник недоступен"));
         let saved=e.state().unwrap();
         assert_eq!(saved.tasks[0].status,"needs_verification");
         assert!(verification_only(&saved.tasks[0]));
+    }
+    #[test]
+    fn winget_already_installed_requires_uninstall_confirmation() {
+        for code in [0x8A15002Bu32,0x8A150061u32] {
+            assert_eq!(winget_already_installed(Some(code as i32)),Some(code));
+            let message=confirm_already_installed(code,Ok(Some("Uninstall: Git; издатель: The Git Development Community".into()))).unwrap();
+            assert_eq!(successful_task_status(&message),"skipped");
+            assert!(message.starts_with(&already_message(code)));
+            for evidence in [Ok(None),Err(anyhow::anyhow!("проверка недоступна"))] {
+                let err=confirm_already_installed(code,evidence).unwrap_err();
+                assert!(err.is::<VerificationPending>());assert!(!is_transient(&err));
+                let mut t=task();t.detail=err.to_string();t.status="needs_verification".into();
+                assert_eq!(saved_already_code(&t),Some(code));assert!(verification_only(&t));
+            }
+        }
+        for code in [None,Some(0),Some(1),Some(0x8A150014u32 as i32)] {assert_eq!(winget_already_installed(code),None);}
+    }
+    #[test]
+    fn timeout_requires_verification_without_outer_retries_or_failed_final() {
+        let mut calls=0;
+        let err=poll_verification(||{calls+=1;Err(system::ReadTimeout("winget list".into()).into())},||panic!("Нет третьей попытки"),||false,6).unwrap_err();
+        assert!(err.is::<VerificationPending>());assert!(!is_transient(&err));assert_eq!(calls,1);
+        assert!(probe_error(system::ReadTimeout("Uninstall".into()).into()).is::<VerificationPending>());
+        let e=Engine::new(PathBuf::new());let c=model::defaults();let mut t=task();t.status="succeeded".into();
+        let run=Run{id:"fixture".into(),plan:Plan{profile:"fixture".into(),fingerprint:"".into(),tasks:vec![],warnings:vec![],readiness:serde_json::json!({}),displays:vec![]},active:true,paused:false,tasks:vec![t],log:vec![],technical:vec![],finished:false};
+        *e.current.lock().unwrap()=Some(run.clone());
+        let message=check_final_programs(&e,&c,&run,|_,_|Err(system::ReadTimeout("PowerShell".into()).into())).unwrap();
+        assert!(message.contains("проверка недоступна: Discord"));
+        assert!(!message.contains("Требуют ручной установки"));
+        assert_eq!(e.state().unwrap().tasks[0].status,"needs_verification");
+    }
+    #[test]
+    fn already_installed_final_keeps_registry_requirement_and_skipped_status() {
+        let e=Engine::new(PathBuf::new());let c=model::defaults();let mut t=task();
+        t.status="needs_verification".into();t.verification_only=true;t.detail=already_message(0x8A15002B);
+        let run=Run{id:"fixture".into(),plan:Plan{profile:"fixture".into(),fingerprint:"".into(),tasks:vec![],warnings:vec![],readiness:serde_json::json!({}),displays:vec![]},active:true,paused:false,tasks:vec![t],log:vec![],technical:vec![],finished:false};
+        *e.current.lock().unwrap()=Some(run.clone());
+        check_final_programs(&e,&c,&run,|_,t|{assert_eq!(saved_already_code(t),Some(0x8A15002B));Ok(true)}).unwrap();
+        assert_eq!(e.state().unwrap().tasks[0].status,"skipped");
+        check_final_programs(&e,&c,&run,|_,_|anyhow::bail!("Uninstall недоступен")).unwrap();
+        let task=e.state().unwrap().tasks[0].clone();
+        assert_eq!(task.status,"needs_verification");assert_eq!(saved_already_code(&task),Some(0x8A15002B));
     }
 }

@@ -7,9 +7,40 @@ use std::{
     os::windows::process::CommandExt,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
+#[derive(Debug)]
+pub(crate) struct ReadTimeout(pub String);
+impl std::fmt::Display for ReadTimeout {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"Истёк тайм-аут команды чтения: {}",self.0)}
+}
+impl std::error::Error for ReadTimeout {}
+#[derive(Debug)]
+struct ReadCancelled;
+impl std::fmt::Display for ReadCancelled {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("Проверка остановлена пользователем")}
+}
+impl std::error::Error for ReadCancelled {}
+pub(crate) fn read_interrupted(err:&anyhow::Error)->bool {
+    err.is::<ReadTimeout>() || err.is::<ReadCancelled>()
+}
+fn check_read_cancel(cancel:Option<&AtomicBool>)->Result<()> {
+    if cancel.is_some_and(|c|c.load(Ordering::SeqCst)) {return Err(ReadCancelled.into());}
+    Ok(())
+}
+fn retry_read<T>(mut read:impl FnMut()->Result<T>,cancel:Option<&AtomicBool>)->Result<T> {
+    check_read_cancel(cancel)?;
+    match read() {
+        Err(err) if err.is::<ReadTimeout>() => {check_read_cancel(cancel)?;read()},
+        result => result,
+    }
+}
 fn raw_command(exe: &str, args: &[String], timeout: Option<Duration>) -> Result<(bool, Option<i32>, String, String)> {
+    raw_command_cancellable(exe,args,timeout,None)
+}
+fn raw_command_cancellable(exe:&str,args:&[String],timeout:Option<Duration>,cancel:Option<&AtomicBool>)->Result<(bool,Option<i32>,String,String)> {
+    check_read_cancel(cancel)?;
     let mut child = Command::new(exe)
         .args(args)
         .creation_flags(0x08000000)
@@ -39,11 +70,14 @@ fn raw_command(exe: &str, args: &[String], timeout: Option<Duration>) -> Result<
     let stderr = drain(Box::new(child.stderr.take().unwrap()));
     let began = std::time::Instant::now();
     let status = loop {
+        if let Err(err)=check_read_cancel(cancel) {
+            let _=child.kill();let _=child.wait();break Err(err);
+        }
         match child.try_wait() {
             Ok(Some(s)) => break Ok(s),
             Ok(None) if timeout.map(|limit| began.elapsed() >= limit).unwrap_or(false) => {
                 let _ = child.kill(); let _ = child.wait();
-                break Err(anyhow::anyhow!("Истёк тайм-аут команды чтения: {exe}"));
+                break Err(ReadTimeout(exe.into()).into());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(e) => {
@@ -52,9 +86,14 @@ fn raw_command(exe: &str, args: &[String], timeout: Option<Duration>) -> Result<
             }
         }
     };
+    let status = status?;
+    while !stdout.is_finished() || !stderr.is_finished() {
+        check_read_cancel(cancel)?;
+        if timeout.is_some_and(|limit|began.elapsed()>=limit) {return Err(ReadTimeout(exe.into()).into());}
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let out = stdout.join().map_err(|_| anyhow::anyhow!("Ошибка чтения stdout"))?;
     let err = stderr.join().map_err(|_| anyhow::anyhow!("Ошибка чтения stderr"))?;
-    let status = status?;
     Ok((status.success(), status.code(), out, err))
 }
 #[derive(Debug)]
@@ -82,20 +121,24 @@ pub fn compact_output(output: &str) -> String {
         chars[chars.len()-3600..].iter().collect::<String>().trim())
 }
 fn ps_with_timeout(script: &str, input: &Value, timeout: Option<Duration>) -> Result<Value> {
+    ps_cancellable(script,input,timeout,None)
+}
+fn ps_cancellable(script:&str,input:&Value,timeout:Option<Duration>,cancel:Option<&AtomicBool>)->Result<Value> {
     let data = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(input)?);
     let script=format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);try {{$i=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{data}'))|ConvertFrom-Json);{script}}} catch {{[Console]::Error.WriteLine($_.Exception.Message);exit 1}}");
     let encoded = base64::engine::general_purpose::STANDARD.encode(
         script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
-    let (ok, _, out, err) = raw_command(
+    let (ok, _, out, err) = raw_command_cancellable(
         &format!("{}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",std::env::var("WINDIR")?),
-        &["-NoProfile".into(),"-NonInteractive".into(),"-EncodedCommand".into(),encoded],timeout)?;
+        &["-NoProfile".into(),"-NonInteractive".into(),"-EncodedCommand".into(),encoded],timeout,cancel)?;
     ensure!(ok, "{}", compact_output(&format!("{out}\n{err}")));
     let out = out.trim_start_matches('\u{feff}').trim();
     if out.is_empty() {return Ok(Value::Null);}
     serde_json::from_str(out).with_context(|| format!("Некорректный ответ PowerShell: {}", compact_output(out)))
 }
 pub fn ps(script: &str, input: &Value) -> Result<Value> {ps_with_timeout(script,input,None)}
-fn ps_readonly(script: &str, input: &Value) -> Result<Value> {ps_with_timeout(script,input,Some(Duration::from_secs(10)))}
+#[cfg(test)]
+fn ps_readonly(script: &str, input: &Value) -> Result<Value> {retry_read(||ps_cancellable(script,input,Some(Duration::from_secs(30)),None),None)}
 pub fn array(v: Value) -> Vec<Value> {
     match v {
         Value::Array(a) => a,
@@ -128,20 +171,32 @@ pub fn inventory() -> Result<Value> {
     )?;
     Ok(v)
 }
+// Источники и границы таблицы: fixes3-report.md. Не использовать частичные имена.
+fn registry_identity(p:&crate::model::Program)->Option<(&'static [&'static str],&'static [&'static str])> {
+    if p.source!="winget" {return None;}
+    Some(match p.id.as_str() {
+        "Valve.Steam" => (&["Steam"], &["Valve Corporation"]),
+        "Mozilla.Firefox" => (&[], &["Mozilla"]),
+        "Telegram.TelegramDesktop" => (&["Telegram Desktop"], &["Telegram FZ-LLC"]),
+        "Git.Git" => (&["Git"], &["The Git Development Community"]),
+        "Discord.Discord" => (&["Discord"], &["Discord Inc.","Discord Inc"]),
+        "Anthropic.Claude" => (&["Claude"], &["Anthropic","Anthropic, PBC","Anthropic PBC"]),
+        "Asus.ArmouryCrate" => (&["ARMOURY CRATE","Armoury Crate"], &["ASUSTeK COMPUTER INC.","ASUSTeK COMPUTER INC"]),
+        _ => return None,
+    })
+}
 fn registry_matches(p: &crate::model::Program, app: &Value) -> bool {
     let name=app["name"].as_str().unwrap_or("").trim();
     let publisher=app["publisher"].as_str().unwrap_or("").trim().to_ascii_lowercase();
     let version=app["version"].as_str().unwrap_or("").trim();
     if !p.version.is_empty() && version!=p.version {return false;}
     if p.source=="direct" {return !p.detect_name.is_empty() && name.eq_ignore_ascii_case(&p.detect_name);}
-    if p.source!="winget" {return false;}
-    let (names,publishers):(&[&str],&[&str])=match p.id.as_str() {
-        "Discord.Discord" => (&["Discord"], &["discord inc.","discord inc"]),
-        "Anthropic.Claude" => (&["Claude"], &["anthropic","anthropic, pbc","anthropic pbc"]),
-        "Asus.ArmouryCrate" => (&["ARMOURY CRATE","Armoury Crate"], &["asustek computer inc.","asustek computer inc"]),
-        _ => return false,
-    };
-    names.iter().any(|n|name.eq_ignore_ascii_case(n)) && publishers.contains(&publisher.as_str())
+    let Some((names,publishers))=registry_identity(p) else {return false;};
+    let exact_name=names.iter().any(|n|name.eq_ignore_ascii_case(n)) ||
+        (p.id=="Mozilla.Firefox" && ["x64","x86","arm64"].iter().any(|arch|
+            ["en-US","ru","en-GB","zh-CN","de","el","ja","es-ES","es-MX","nb-NO"].iter()
+                .any(|locale|name.eq_ignore_ascii_case(&format!("Mozilla Firefox ({arch} {locale})")))));
+    exact_name && publishers.iter().any(|s|s.eq_ignore_ascii_case(&publisher))
 }
 fn winget_list_evidence(output: &str, p: &crate::model::Program) -> Option<String> {
     let mut table=false;
@@ -201,15 +256,33 @@ fn vencord_at(discord: &std::path::Path, data: &std::path::Path) -> Result<bool>
     Ok(false)
 }
 pub fn installed(p: &crate::model::Program) -> Result<bool> {
-    installed_check(p,&mut None)
+    installed_check(p,&mut None,None)
 }
 pub fn installed_evidence(p: &crate::model::Program) -> Result<Option<String>> {
+    installed_evidence_cancellable(p,None)
+}
+pub(crate) fn installed_evidence_cancellable(p:&crate::model::Program,cancel:Option<&AtomicBool>)->Result<Option<String>> {
     let mut evidence=None;
-    if installed_check(p,&mut evidence)? {
+    if installed_check(p,&mut evidence,cancel)? {
         Ok(Some(evidence.unwrap_or_else(||"Проверка Vencord: подтверждён загрузчик модификации в текущей версии Discord и файл patcher.js".into())))
     } else { Ok(None) }
 }
-fn installed_check(p: &crate::model::Program, evidence: &mut Option<String>) -> Result<bool> {
+pub(crate) fn uninstall_evidence(p:&crate::model::Program,cancel:Option<&AtomicBool>)->Result<Option<String>> {
+    check_read_cancel(cancel)?;
+    ensure!(p.source=="direct" || registry_identity(p).is_some(),"Для {} нет подтверждённого правила Uninstall",p.name);
+    let apps=retry_read(||ps_cancellable(r#"
+$roots=@('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+$apps=@(foreach($root in $roots){if(Test-Path -LiteralPath $root){Get-ItemProperty ($root+'\*') -ErrorAction Stop|ForEach-Object {@{name=[string]$_.DisplayName;publisher=[string]$_.Publisher;version=[string]$_.DisplayVersion}}}})
+ConvertTo-Json -InputObject $apps -Depth 3
+"#,&json!({}),Some(Duration::from_secs(30)),cancel),cancel)?;
+    Ok(array(apps).iter().find(|a|registry_matches(p,a)).map(|app|format!(
+        "Uninstall: {}; издатель: {}; версия: {}; точное совпадение {}",
+        app["name"].as_str().unwrap_or(""),app["publisher"].as_str().filter(|s|!s.is_empty()).unwrap_or("не указан"),
+        app["version"].as_str().filter(|s|!s.is_empty()).unwrap_or("не указана"),
+        if p.source=="direct" {"detect_name"} else {"имени и разрешённого издателя"})))
+}
+fn installed_check(p: &crate::model::Program, evidence: &mut Option<String>,cancel:Option<&AtomicBool>) -> Result<bool> {
+    check_read_cancel(cancel)?;
     if p.source=="git" {return Ok(false);}
     if p.source=="winget" && p.id=="Vendicated.Vencord" {
         ensure!(p.version.is_empty(),"Версия установщика Vencord не подтверждает версию модификации Discord; автоматическая проверка закреплённой версии недоступна");
@@ -220,27 +293,18 @@ fn installed_check(p: &crate::model::Program, evidence: &mut Option<String>) -> 
         return vencord_at(&PathBuf::from(local).join("Discord"),&data);
     }
     let mut registry_error=None;
-    if p.source=="direct" || (p.source=="winget" && ["Discord.Discord","Anthropic.Claude","Asus.ArmouryCrate"].contains(&p.id.as_str())) {
-        let apps=ps_readonly(r#"
-$roots=@('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
-$apps=@(foreach($root in $roots){if(Test-Path -LiteralPath $root){Get-ItemProperty ($root+'\*') -ErrorAction Stop|ForEach-Object {@{name=[string]$_.DisplayName;publisher=[string]$_.Publisher;version=[string]$_.DisplayVersion}}}})
-ConvertTo-Json -InputObject $apps -Depth 3
-"#,&json!({}));
-        match apps {
-            Ok(apps) => {if let Some(app)=array(apps).iter().find(|a|registry_matches(p,a)){
-                *evidence=Some(format!("Uninstall: {}; издатель: {}; версия: {}; точное совпадение {}",
-                    app["name"].as_str().unwrap_or(""),app["publisher"].as_str().filter(|s|!s.is_empty()).unwrap_or("не указан"),
-                    app["version"].as_str().filter(|s|!s.is_empty()).unwrap_or("не указана"),
-                    if p.source=="direct" {"detect_name"} else {"имени и разрешённого издателя"}));
-                return Ok(true);
-            }},
+    if p.source=="direct" || registry_identity(p).is_some() {
+        match uninstall_evidence(p,cancel) {
+            Ok(Some(found)) => {*evidence=Some(found);return Ok(true);},
+            Ok(None) => {},
+            Err(e) if read_interrupted(&e) => return Err(e),
             Err(e) => registry_error=Some(e),
         }
         if p.source=="direct" {return match registry_error {Some(e)=>Err(e),None=>Ok(false)};}
     }
     let args=vec!["list".into(),"--id".into(),p.id.clone(),"--exact".into(),"--source".into(),p.source.clone(),
         "--accept-source-agreements".into(),"--disable-interactivity".into()];
-    let (ok,code,out,err)=raw_command("winget.exe",&args,Some(Duration::from_secs(20)))?;
+    let (ok,code,out,err)=retry_read(||raw_command_cancellable("winget.exe",&args,Some(Duration::from_secs(60)),cancel),cancel)?;
     if ok {
         *evidence=winget_list_evidence(&out,p);
         if evidence.is_some() {return Ok(true);}
@@ -814,6 +878,48 @@ mod reliability_tests {
         let armoury=program("Asus.ArmouryCrate");
         assert!(!registry_matches(&armoury,&json!({"name":"ARMOURY CRATE Lite Service","publisher":"ASUSTeK COMPUTER INC."})));
         assert!(registry_matches(&armoury,&json!({"name":"ARMOURY CRATE","publisher":"ASUSTeK COMPUTER INC."})));
+    }
+    #[test]
+    fn profile_registry_names_and_publishers_are_exact() {
+        for (id,name,publisher) in [
+            ("Valve.Steam","Steam","Valve Corporation"),
+            ("Mozilla.Firefox","Mozilla Firefox (x64 ru)","Mozilla"),
+            ("Mozilla.Firefox","Mozilla Firefox (x64 en-US)","Mozilla"),
+            ("Telegram.TelegramDesktop","Telegram Desktop","Telegram FZ-LLC"),
+            ("Git.Git","Git","The Git Development Community"),
+            ("Anthropic.Claude","Claude","Anthropic PBC"),
+        ] {
+            let mut p=program(id);
+            let app=json!({"name":name,"publisher":publisher,"version":"1.2.3"});
+            assert!(registry_matches(&p,&app),"{id}");
+            assert!(!registry_matches(&p,&json!({"name":format!("{name} Helper"),"publisher":publisher})),"{id}");
+            assert!(!registry_matches(&p,&json!({"name":name,"publisher":format!("{publisher} Other")})),"{id}");
+            p.version="1.2.3".into();assert!(registry_matches(&p,&app));
+            p.version="1.2".into();assert!(!registry_matches(&p,&app));
+        }
+        let firefox=program("Mozilla.Firefox");
+        for name in ["Firefox","Mozilla Firefox","Mozilla Firefox ESR (x64 ru)","Mozilla Firefox (x64 ru) Updater"] {
+            assert!(!registry_matches(&firefox,&json!({"name":name,"publisher":"Mozilla"})));
+        }
+        assert!(registry_identity(&program("Vendicated.Vencord")).is_none());
+        assert!(registry_identity(&program("XP8CLZL93F5Z4P")).is_none());
+    }
+    #[test]
+    fn read_timeout_retries_once_and_cancellation_prevents_retry() {
+        let mut calls=0;
+        let result:Result<()>=retry_read(||{calls+=1;Err(ReadTimeout("fixture".into()).into())},None);
+        assert_eq!(calls,2);assert!(result.unwrap_err().is::<ReadTimeout>());
+        calls=0;
+        let result=retry_read(||{calls+=1;if calls==1 {Err(ReadTimeout("fixture".into()).into())} else {Ok(42)}},None);
+        assert_eq!(result.unwrap(),42);assert_eq!(calls,2);
+        calls=0;
+        let result:Result<()>=retry_read(||{calls+=1;anyhow::bail!("отказ доступа")},None);
+        assert!(result.is_err());assert_eq!(calls,1);
+        let cancel=AtomicBool::new(false);calls=0;
+        let result:Result<()>=retry_read(||{calls+=1;cancel.store(true,Ordering::SeqCst);Err(ReadTimeout("fixture".into()).into())},Some(&cancel));
+        assert!(result.unwrap_err().is::<ReadCancelled>());assert_eq!(calls,1);
+        let result:Result<()>=retry_read(||panic!("Чтение после отмены"),Some(&cancel));
+        assert!(result.unwrap_err().is::<ReadCancelled>());
     }
     #[test]
     fn winget_identity_and_version_are_not_substring_matches() {
